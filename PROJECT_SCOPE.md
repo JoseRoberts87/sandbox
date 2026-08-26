@@ -163,11 +163,15 @@ raw and writes processed should not have any grant that names the artifacts
 bucket. Also allows per-zone lifecycle and replication rules without prefix
 gymnastics.
 
+**Decided (2026-08-25):** three buckets — `raw`, `processed`, `artifacts`. Implemented.
+
 **D-12 — Partition layout.** Proposal:
 `s3://<proj>-<env>-raw/<source>/<dataset>/ingest_date=YYYY-MM-DD/<file>` and
 `s3://<proj>-<env>-processed/<dataset>/<partition_key>=.../`.
 The partition key for the processed zone should be whatever the ETL and Redshift
 loads actually filter on — event date, not ingest date, if those differ.
+
+**Decided (2026-08-26):** `<source>/<dataset>/ingest_date=YYYY-MM-DD/` for both raw and processed, documented in [docs/data-layout.md](./docs/data-layout.md). Whether the processed zone should additionally (or instead) partition on *event* date stays open until the schema is known — Q-01, Q-02.
 
 **D-13 — Encryption.** SSE-S3 (free, AWS-managed) or SSE-KMS with a
 customer-managed key (auditable, grantable, ~$1/month/key plus request charges)?
@@ -197,6 +201,8 @@ Crawlers are convenient but they infer types, change them silently between runs,
 and put the schema outside version control. Keep a crawler available for
 exploring new/unknown sources, but nothing production reads from a crawled table.
 
+**Decided (2026-08-26), with a caveat:** an on-demand crawler exists for the raw zone, exploration only, and nothing downstream reads from it. The *processed* table is currently created by the job's catalog sink rather than declared in Terraform, because we do not yet know the schema to declare. That is a deliberate temporary deviation: **T-2.10** moves the processed table into Terraform once the schema is fixed, and flips `--update_catalog` to `false`.
+
 **D-17 — Orchestration.** Glue Workflows with triggers, Step Functions, or
 EventBridge Scheduler firing a single job?
 *Recommendation:* start with EventBridge Scheduler → one Glue job while there is
@@ -205,11 +211,15 @@ cross-service sequence (Glue → Redshift COPY → SageMaker). Step Functions ha
 better failure visibility and retry semantics than Glue Workflows and is not much
 more Terraform. Avoid MWAA — the cost floor is high for this workload.
 
+**Decided (2026-08-26):** EventBridge Scheduler firing a single Glue job. Revisit when a second step exists — the Redshift COPY in phase 3 is the likely trigger for moving to Step Functions.
+
 **D-18 — Trigger mode.** Schedule (cron) vs. event-driven (S3 object created →
 EventBridge → job)?
 *Recommendation:* depends on D-15/Q-01. Files that arrive on a predictable
 schedule → cron. Files that arrive whenever a vendor feels like it → event-driven,
 with a debounce so 400 files do not start 400 job runs.
+
+**Decided (2026-08-26):** scheduled (cron), daily at 06:00 UTC, **created disabled**. Nothing fires until there is real data and an answer to Q-08.
 
 **D-19 — Incremental vs. full reprocessing.** Glue job bookmarks give us
 incremental processing for free but make "reprocess last month" awkward.
@@ -217,6 +227,8 @@ incremental processing for free but make "reprocess last month" awkward.
 explicit date-range parameter that bypasses bookmarks for backfills. Writes are
 idempotent per partition (overwrite the partition, do not append) so a rerun
 cannot double-count.
+
+**Revised (2026-08-26): bookmarks are off.** The layout already partitions raw by `ingest_date`, so a run is addressed by a date and the job purges the target partition before rewriting it. That makes reruns idempotent and a backfill the identical code path with a different `--ingest_date`. Bookmarks would add service-side progress state that can drift from what is actually in S3, and would make backfills a special case. The trade-off: a file that lands late into an already-processed partition is not picked up automatically — that date must be rerun. Acceptable while cadence is daily and volumes are small; revisit if late-arriving data becomes normal.
 
 **D-20 — Data quality.** AWS Glue Data Quality rulesets, assertions written into
 the job, or an external framework?
@@ -226,10 +238,14 @@ land in CloudWatch. Needs a policy decision: does a failed rule **stop** the loa
 Proposal: fail closed on schema/uniqueness/null-key violations, warn on
 distribution drift.
 
+**Partially decided (2026-08-26):** the job fails closed on an empty partition and on missing required columns (`--required_columns`). Formal Glue Data Quality rulesets need a catalog table to target, so they land with T-2.10 once the schema is declared.
+
 **D-21 — Language and structure of job code.** PySpark scripts in the repo,
 uploaded to the scripts bucket. Glue Studio's visual editor produces code we
 cannot review in a diff, so it is out. Python shell jobs are an option for small
 datasets where Spark is overkill — worth checking once we know data volume (Q-05).
+
+**Decided (2026-08-26):** PySpark scripts under `glue/jobs/`, reviewed in diffs like any other code. Glue 5.0, `G.1X`, 2 workers to start — revisit against real volume (Q-05).
 
 ### Warehouse
 
@@ -358,6 +374,8 @@ deployed script matches the commit? or synced separately?) and Redshift *schema
 DDL* (Terraform has no good story for this; a migration tool or a versioned SQL
 directory applied manually is the usual answer).
 
+**Decided for Glue scripts (2026-08-26):** Terraform uploads them (`aws_s3_object` with `source_hash`, not `etag` — KMS-encrypted objects have no MD5 etag), so the deployed script always matches the commit. Redshift DDL is still open.
+
 **D-39 — Cost guardrails.** An AWS Budget with an alarm at a threshold set from
 Q-07, S3 lifecycle rules, Redshift Serverless auto-pause, Serverless Inference,
 and a documented teardown procedure for the dev environment.
@@ -404,15 +422,13 @@ starts before the previous phase is applied and verified.
 | **6. Hardening** | Alarms, budget, log retention, runbooks, teardown procedure | A deliberately failed job produces an alert; teardown leaves no billable resources |
 
 Detailed task breakdowns for each phase come later, one phase at a time.
+Live progress against these phases is tracked in [TODO.md](./TODO.md).
 
-**Current status (2026-08-25):** Phase 0 and the raw bucket from Phase 1 are
-written and validated (`terraform validate` passes, provider resolved and
-locked), but **not yet applied** — pending AWS credentials and confirmation of
-Q-06 (account/region). Decisions realised in code so far: D-11 (module reusable
-per zone), D-13 (customer-managed KMS key), D-14 (versioned, 90-day cold
-transition, no expiry), D-32 (local state), D-33 (version pinning +
-`.terraform.lock.hcl` committed), D-34 (`envs/` + `modules/` layout), D-36
-(naming prefix + `default_tags`).
+**Current status (2026-08-26):** Phases 0 and 1 are applied. Phase 2 (ETL) is
+written and validated but **not yet applied** — processed and artifacts buckets,
+Glue catalog databases, the `raw_to_processed` PySpark job and its execution
+role, an on-demand raw crawler, and a daily schedule created in a disabled
+state.
 
 ---
 
@@ -435,3 +451,5 @@ transition, no expiry), D-32 (local state), D-33 (version pinning +
 |---|---|
 | 2026-08-25 | Initial scope. Architecture, D-01–D-40, Q-01–Q-09, seven-phase build order. |
 | 2026-08-25 | D-32 decided: local state first, migrate to S3 remote state later. Phase 0 + raw bucket implemented. |
+| 2026-08-25 | Added `TODO.md` — phase-by-phase task tracker keyed to these decisions. |
+| 2026-08-26 | Phase 2 (ETL) built. D-11, D-12, D-17, D-18, D-21, D-38 decided; D-16 and D-20 partially decided pending schema; **D-19 revised** — bookmarks off, in favour of date-addressed idempotent partition rewrites. |

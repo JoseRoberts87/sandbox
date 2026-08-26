@@ -198,3 +198,183 @@ Accepted as-is, unapplied. Two assumptions were made rather than blocking:
 `aws_region = "us-east-1"` and `project = "sandbox"` — both are placeholders
 pending Q-06, and both force resource replacement if changed after the first
 apply.
+
+---
+
+### 004 — Task tracker
+
+- **Date:** 2026-08-25
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `TODO.md` (new), `README.md`, `PROJECT_SCOPE.md`
+
+**Prompt**
+
+```text
+lets add a series of todos in a file so that we can track progress
+```
+
+**Output**
+
+Created `TODO.md`, 54 tasks across the seven phases from `PROJECT_SCOPE.md` §7,
+with stable IDs (`T-<phase>.<n>`) and a marker legend (done / blocked / in
+progress). Structure:
+
+- A **Now** section naming the next three actions, and a **Blocked** table
+  giving the reason for each stalled task (expired credentials, Q-06, Q-01).
+- **Phases 0 and 1** as concrete tasks — 10 already complete from entry 003,
+  the rest covering apply, posture verification, and the prefix layout.
+- **Phases 2–6** deliberately coarse, marked *(to expand)*, each item pointing
+  at the decision it depends on.
+- **Cross-cutting** tasks: keeping this log current, resolving Q-01–Q-09, and
+  adding `tflint`/`checkov` once there is more than one module.
+
+Two ordering constraints were encoded as tasks rather than left implicit:
+**T-2.9** gates Phase 3 on migrating state off the laptop (per D-32), and
+**T-0.10** puts the Terraform upgrade before that migration so it can use native
+S3 lockfiles instead of a DynamoDB table that would later be removed.
+
+Cross-linked from `README.md` and `PROJECT_SCOPE.md` §7.
+
+**Notes**
+
+Accepted as-is. Task counts and completion state reflect work through entry 003;
+nothing has been applied to AWS.
+
+---
+
+### 005 — Phase 2: Glue ETL, and the raw/processed prefix layout
+
+- **Date:** 2026-08-26
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `docs/data-layout.md` (new), `glue/jobs/raw_to_processed.py` (new), `envs/dev/{main,kms,storage,glue,iam,variables,outputs}.tf`, `envs/dev/terraform.tfvars`, `modules/s3_bucket/{main,variables}.tf`, `README.md`, `PROJECT_SCOPE.md`, `TODO.md`
+
+**Prompt**
+
+```text
+i have updated some of the todos as i completed them myself. lets proceed with the document prefix layout being `<source>/<dataset>/ingest_date=YYYY-MM-DD/` and lets proceed with the ETL phase. for now, the AWS Glue service will be used for the ETL.
+```
+
+**Output**
+
+Read the current `TODO.md` and Terraform state first to pick up work done
+outside this session: phases 0 and 1 were applied, Terraform upgraded to 1.15.8,
+and `bucket_suffix` had been changed from the account ID to `var.owner` (so the
+deployed bucket is `sandbox-dev-raw-data-platform`). Followed that convention for
+the new buckets and corrected the now-inaccurate comment that still described an
+account-ID suffix.
+
+**`docs/data-layout.md`** (T-1.7) — the prefix layout as a settled convention:
+segment definitions and naming rules, why Hive-style `ingest_date=` partitioning
+(catalog recognition, partition pruning, addressable reruns), per-zone
+descriptions with worked examples, the artifacts-bucket prefix table, lineage
+columns, landing and reprocessing commands, and an open note that event-date
+partitioning may be needed once the schema is known.
+
+**Terraform** — split `envs/dev` into `main.tf` (locals), `kms.tf`, `storage.tf`,
+`glue.tf`, `iam.tf`; resource addresses are unchanged, so the existing resources
+should not re-plan. Added:
+
+- **Processed and artifacts buckets** (T-1.8). Processed is unversioned —
+  regenerable from raw, so retaining superseded versions of rewritten partitions
+  is not worth the storage. Artifacts is versioned. Extended the bucket module
+  with an `expiring_prefixes` variable so Glue temp and Spark event logs expire
+  after 7 days instead of accumulating silently.
+- **Glue catalog databases** per zone, plus an on-demand crawler over raw for
+  schema discovery only.
+- **`aws_glue_job`** — Glue 5.0, `G.1X` × 2, 60-minute timeout,
+  `max_concurrent_runs = 1`, bookmarks disabled, script uploaded by Terraform
+  with `source_hash` (not `etag`, which KMS-encrypted objects do not expose).
+- **IAM** — explicit least-privilege policies rather than `AWSGlueServiceRole`,
+  which grants broad access to `aws-glue-*` buckets that are not ours. Raw is
+  read-only to the job. Separate crawler role; scheduler role with an
+  `aws:SourceAccount` confused-deputy guard.
+- **EventBridge Scheduler** targeting `glue:startJobRun`, **created disabled**.
+
+**`glue/jobs/raw_to_processed.py`** — reads one `ingest_date` partition, resolves
+`latest`/`yesterday`/`today`/explicit dates, normalizes column names to
+Athena-safe `snake_case` (with collision disambiguation), fails closed on an
+empty partition or missing required columns, trims strings, stamps lineage
+(`etl_source_file`, `etl_processed_at`, `etl_job_run_id`), purges the target
+partition, then writes Snappy Parquet through the Glue catalog sink.
+
+**Decision surfaced rather than made silently:** D-19 was revised — job bookmarks
+are off. Because raw is partitioned by `ingest_date`, a run is addressed by a
+date and purge-then-write makes reruns idempotent, so a backfill is the same code
+path with a different argument. Bookmarks would put progress state in the Glue
+service where it can drift from S3. The cost is that late-arriving files in an
+already-processed partition need a manual rerun of that date. Recorded in the
+scope doc with the trade-off stated.
+
+Updated `PROJECT_SCOPE.md` (D-11, D-12, D-17, D-18, D-21, D-38 decided; D-16 and
+D-20 partially decided; D-19 revised; status and changelog), `TODO.md` (T-1.7,
+T-1.8 and seven phase-2 tasks closed; five new tasks added for apply, end-to-end
+run, crawl, idempotency check and Athena verification), and `README.md`.
+
+**Verification run:** `terraform fmt -recursive -check` clean, `terraform
+validate` **Success**, `python3 -m py_compile` on the job script passes.
+`terraform plan` was **not** run — the SSO token is expired again — so this is
+unapplied and has never executed against real data.
+
+**Notes**
+
+Accepted as-is, unapplied. Two deliberate deviations from the scope, both
+recorded: the processed catalog table is created by the job's sink rather than
+declared in Terraform (D-16), and `inferSchema` is used for CSV — both are
+temporary because the real schema is unknown, and both are closed out by T-2.10
+once it is. `etl_source_name = "manual"` and `etl_dataset = "sample"` are
+placeholders pending Q-01.
+
+---
+
+### 006 — CLAUDE.md
+
+- **Date:** 2026-08-26
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `CLAUDE.md` (new), `README.md`
+
+**Prompt**
+
+```text
+/init
+
+Please analyze this codebase and create a CLAUDE.md file, which will be given to future instances of Claude Code to operate in this repository.
+```
+
+**Output**
+
+Checked for existing agent configuration first — no `CLAUDE.md`, no
+`.cursorrules`, no `.cursor/rules/`, no `.github/copilot-instructions.md`.
+
+Created `CLAUDE.md` covering what a future session cannot infer from any single
+file:
+
+- **Working rules** that are project decisions rather than preferences: never
+  `terraform apply` or `destroy` (D-07), never commit unprompted (D-08), append
+  to `AI_USAGE.md` every exchange, local state is the only record of what exists,
+  and deviations from the scope get recorded in `PROJECT_SCOPE.md` rather than
+  made quietly.
+- **The document system** — how `PROJECT_SCOPE.md`, `TODO.md`, `AI_USAGE.md` and
+  `docs/data-layout.md` interlock, that `D-##`/`Q-##`/`T-##` IDs are stable and
+  should be referenced rather than restated, and the decide → track → implement →
+  log flow.
+- **Commands**, split by whether they need AWS credentials, with the note that a
+  `plan` failing on `InvalidClientTokenId` is an expired SSO token rather than a
+  broken configuration. Stated plainly that there is no test suite.
+- **Architecture notes** that require reading several files to reconstruct: the
+  `envs/` + `modules/` split, `bucket_suffix = var.owner` and its global-collision
+  caveat, the three zones and their differing versioning, the KMS grant that new
+  roles always need, the date-addressed idempotent ETL contract and why bookmarks
+  are off, `source_hash` versus `etag` for script upload, and why IAM is written
+  explicitly instead of using `AWSGlueServiceRole`.
+- **Known temporary state** — the sink-managed catalog table and `inferSchema`,
+  both flagged as not-the-intended-design and tied to T-2.10, plus the
+  placeholder `etl_source_name` / `etl_dataset` values.
+
+Added `CLAUDE.md` to the project structure listing in `README.md`.
+
+**Notes**
+
+Accepted as-is. No repository rules from other tools existed to fold in.

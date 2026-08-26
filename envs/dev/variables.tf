@@ -60,3 +60,98 @@ variable "force_destroy_buckets" {
   type        = bool
   default     = false
 }
+
+# ------------------------------- storage: zones -------------------------------
+
+variable "artifacts_noncurrent_version_expiration_days" {
+  description = "Days before superseded versions of artifacts (scripts, models) are deleted."
+  type        = number
+  default     = 180
+}
+
+variable "glue_scratch_expiration_days" {
+  description = "Days before Glue temp and Spark event-log objects expire. Scratch data that is billed for indefinitely if left alone."
+  type        = number
+  default     = 7
+}
+
+# ----------------------------------- glue -------------------------------------
+
+variable "glue_version" {
+  description = "AWS Glue version. 5.0 is Spark 3.5 / Python 3.11."
+  type        = string
+  default     = "5.0"
+}
+
+variable "glue_worker_type" {
+  description = "Glue worker type. G.1X is 4 vCPU / 16GB — the right starting point until data volume is known (Q-05)."
+  type        = string
+  default     = "G.1X"
+
+  validation {
+    condition     = contains(["G.1X", "G.2X", "G.4X", "G.8X", "G.025X"], var.glue_worker_type)
+    error_message = "Invalid Glue worker type."
+  }
+}
+
+variable "glue_number_of_workers" {
+  description = "Number of Glue workers. 2 is the minimum and is plenty for small batches."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.glue_number_of_workers >= 2
+    error_message = "Glue requires at least 2 workers."
+  }
+}
+
+variable "glue_timeout_minutes" {
+  description = "Job timeout. Low on purpose — a job that hangs should fail fast rather than bill for the AWS default of 48 hours."
+  type        = number
+  default     = 60
+}
+
+variable "enable_raw_crawler" {
+  description = "Create the on-demand raw-zone crawler used for schema discovery (D-16). Exploration only; nothing downstream reads a crawled table."
+  type        = bool
+  default     = true
+}
+
+# ------------------------------ etl job defaults ------------------------------
+# Defaults baked into the job definition. Override per run with
+# `aws glue start-job-run --arguments '{"--ingest_date":"2026-08-01"}'`.
+
+variable "etl_source_name" {
+  description = "Default source segment of the data path. Placeholder until Q-01 is answered."
+  type        = string
+  default     = "manual"
+}
+
+variable "etl_dataset" {
+  description = "Default dataset segment of the data path. Placeholder until Q-01 is answered."
+  type        = string
+  default     = "sample"
+}
+
+variable "etl_source_format" {
+  description = "Default raw file format: csv, json or parquet."
+  type        = string
+  default     = "csv"
+
+  validation {
+    condition     = contains(["csv", "json", "parquet"], var.etl_source_format)
+    error_message = "Source format must be csv, json or parquet."
+  }
+}
+
+variable "etl_schedule_enabled" {
+  description = "Whether the ETL schedule fires. Off until cadence (Q-08) is settled and real data is landing."
+  type        = bool
+  default     = false
+}
+
+variable "etl_schedule_expression" {
+  description = "EventBridge Scheduler expression, evaluated in UTC."
+  type        = string
+  default     = "cron(0 6 * * ? *)"
+}
