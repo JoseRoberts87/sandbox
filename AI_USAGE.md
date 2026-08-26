@@ -133,3 +133,68 @@ Setup/usage/test sections remain `TODO` — there is no code to document yet.
 
 Accepted as-is. §5 recommendations are proposals, not settled; §6 questions are
 outstanding and block roughly a third of the open decisions.
+
+---
+
+### 003 — Phase 0 foundations and the raw S3 bucket
+
+- **Date:** 2026-08-25
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `.gitignore`, `modules/s3_bucket/*`, `envs/dev/*`, `README.md`, `PROJECT_SCOPE.md`
+
+**Prompt**
+
+```text
+lets start with setting up the terraform and the bucket where the file containing the data will be stored. that will be the very first thing we will deploy. we will start with using a local state and migrate to a remote state file later
+```
+
+**Output**
+
+Checked the local toolchain first (Terraform 1.9.8, AWS CLI 2.18.15, SSO token
+expired) and queried the Terraform registry for the current AWS provider
+(6.61.0) rather than guessing a version to pin.
+
+Created:
+
+- **`.gitignore`** — excludes `*.tfstate*`, `.terraform/`, and saved plans.
+  Load-bearing given local state: state is a plaintext record of every resource
+  and will hold secrets once Redshift exists. Explicitly *keeps*
+  `.terraform.lock.hcl` and `terraform.tfvars`.
+- **`modules/s3_bucket/`** — reusable bucket module owning the security posture:
+  public access blocked on all four flags, `BucketOwnerEnforced` ownership (ACLs
+  disabled), versioning, default encryption (SSE-KMS with `bucket_key_enabled`,
+  or SSE-S3 when no key is passed), a lifecycle configuration built from
+  `dynamic` blocks (abort incomplete multipart uploads, cold-storage transition,
+  noncurrent version expiry), and a bucket policy denying non-TLS requests.
+- **`envs/dev/`** — root module with a customer-managed KMS key (rotation
+  enabled), the raw bucket named `<project>-<env>-raw-<account-id>` (account ID
+  as a deterministic suffix for global uniqueness, avoiding a random value in
+  state), provider `default_tags`, validated input variables, and outputs for
+  the bucket name/ARN and key ARN that phase 2 will consume.
+
+Terraform version pinned `>= 1.9.0, < 2.0.0`, AWS provider `~> 6.61`, with the
+S3 backend block written but commented out and annotated with the migration
+steps — including the note that `use_lockfile` needs Terraform >= 1.10 while
+1.9.8 is installed, so upgrading before migrating avoids a throwaway DynamoDB
+lock table.
+
+**Verification run:** `terraform fmt -recursive` (clean), `terraform init`
+(provider 6.61.0 resolved, lock file written), `terraform validate` (**Success**).
+`terraform plan` reached the provider and failed at
+`STS: GetCallerIdentity — InvalidClientTokenId` because the SSO token is expired.
+So the configuration is syntactically and semantically valid but **has not been
+planned against a real account**. Also confirmed via `git status` that no state
+or provider files would be committed.
+
+Updated `PROJECT_SCOPE.md` (D-32 rewritten as decided-local-first, with the
+constraint that state must move remote before Redshift lands in Phase 3; status
+note added to §7; changelog entry) and `README.md` (requirements, setup, usage,
+teardown, structure).
+
+**Notes**
+
+Accepted as-is, unapplied. Two assumptions were made rather than blocking:
+`aws_region = "us-east-1"` and `project = "sandbox"` — both are placeholders
+pending Q-06, and both force resource replacement if changed after the first
+apply.

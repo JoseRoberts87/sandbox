@@ -1,0 +1,40 @@
+# ---- Terraform ----
+# Local state. NEVER commit: it is a plaintext record of every resource, and
+# once Redshift/Secrets Manager land it will contain sensitive values.
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Provider plugins and module cache
+.terraform/
+
+# Saved plans — can contain variable values
+*.tfplan
+tfplan
+plan.out
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Local CLI config / overrides
+.terraformrc
+terraform.rc
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# NOTE: .terraform.lock.hcl IS committed on purpose (D-33 — provider pinning).
+# NOTE: envs/*/terraform.tfvars IS committed on purpose — it holds non-secret
+#       config only. Never put credentials in it.
+
+# ---- Python (Glue job scripts, later) ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# ---- macOS ----
+.DS_Store

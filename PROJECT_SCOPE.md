@@ -309,12 +309,18 @@ the swap is worth deciding explicitly rather than by accident.
 
 ### Terraform and platform
 
-**D-32 — State backend.** S3 bucket for state with locking. Modern Terraform
-supports native S3 lockfiles, removing the DynamoDB table — worth confirming
-against the version we pin (D-33). Bootstrapping is the awkward part: the state
-bucket cannot manage its own creation. *Recommendation:* a small, separate
-bootstrap configuration with local state, committed, applied once, then left
-alone.
+**D-32 — State backend.** **Decided: start with local state, migrate to S3
+later.** Local state avoids the bootstrap problem entirely for the first deploy
+— the state bucket cannot manage its own creation — and keeps the first apply to
+a single command. The commented backend block in `envs/dev/versions.tf` holds the
+migration path (`terraform init -migrate-state`).
+
+Two things to settle before migrating: native S3 lockfiles (`use_lockfile`)
+require Terraform >= 1.10 and the installed version is 1.9.8, so migrating today
+means a DynamoDB lock table that we would later remove — upgrading Terraform
+first is the cheaper order. And local state must not outlive Phase 3: the moment
+Redshift exists, state contains sensitive values and a laptop is the wrong place
+for the only copy. Migrate at the end of Phase 2 at the latest.
 
 **D-33 — Version pinning.** Pin `required_version` for Terraform and a `~>`
 constraint on the AWS provider, with `.terraform.lock.hcl` committed. Manual
@@ -399,6 +405,15 @@ starts before the previous phase is applied and verified.
 
 Detailed task breakdowns for each phase come later, one phase at a time.
 
+**Current status (2026-08-25):** Phase 0 and the raw bucket from Phase 1 are
+written and validated (`terraform validate` passes, provider resolved and
+locked), but **not yet applied** — pending AWS credentials and confirmation of
+Q-06 (account/region). Decisions realised in code so far: D-11 (module reusable
+per zone), D-13 (customer-managed KMS key), D-14 (versioned, 90-day cold
+transition, no expiry), D-32 (local state), D-33 (version pinning +
+`.terraform.lock.hcl` committed), D-34 (`envs/` + `modules/` layout), D-36
+(naming prefix + `default_tags`).
+
 ---
 
 ## 8. Known risks
@@ -419,3 +434,4 @@ Detailed task breakdowns for each phase come later, one phase at a time.
 | Date | Change |
 |---|---|
 | 2026-08-25 | Initial scope. Architecture, D-01–D-40, Q-01–Q-09, seven-phase build order. |
+| 2026-08-25 | D-32 decided: local state first, migrate to S3 remote state later. Phase 0 + raw bucket implemented. |
