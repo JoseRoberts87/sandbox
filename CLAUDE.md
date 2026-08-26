@@ -1,0 +1,143 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+A batch ETL pipeline and ML inference API on AWS, built in phases:
+S3 (raw) → Glue → S3 (processed) → Redshift → SageMaker training → inference endpoint.
+All infrastructure is Terraform. There is no application code beyond Glue job
+scripts, and no CI.
+
+Phases 0–1 (Terraform foundations, raw bucket, KMS) are **applied**. Phase 2
+(Glue ETL) is **written and validated but not applied**. Phases 3–6 are not
+started.
+
+## Working rules specific to this project
+
+These are project decisions, not preferences — breaking them silently is worse
+than asking.
+
+- **Never run `terraform apply`.** A developer applies manually after reviewing
+  the plan (D-07). Same for `terraform destroy`.
+- **Never commit or push unprompted** (D-08). Work is merged via branch → PR.
+- **Append to `AI_USAGE.md` after every exchange.** This is the point of the
+  repo's documentation practice, not an optional extra. Follow the template at
+  the top of that file: verbatim prompt, substance of the output, and a Notes
+  line saying whether it was accepted, modified or rejected. Entries are
+  append-only and numbered.
+- **State is local** (`envs/dev/terraform.tfstate`, gitignored) and is the only
+  record of what exists. Do not delete it. It must migrate to S3 before Redshift
+  lands — tracked as T-2.9, because state will then contain secrets.
+- **Record deviations from the scope; do not make them quietly.** When
+  implementation diverges from a decision, update that decision in
+  `PROJECT_SCOPE.md` with the reasoning and trade-off, and add a task to close it
+  out. Existing examples: D-19 revised, D-16 and D-20 partially deviated.
+
+## The document system
+
+Four files interlock, and IDs are stable across all of them. Reference IDs
+rather than restating their content.
+
+| File | Holds | ID scheme |
+|---|---|---|
+| `PROJECT_SCOPE.md` | Architecture, decisions made (§4), decisions open (§5), unanswered questions (§6), phase plan (§7) | `D-##`, `Q-##` |
+| `TODO.md` | Task tracker per phase, with a Now/Blocked summary at the top | `T-<phase>.<n>` |
+| `AI_USAGE.md` | Every prompt and model output | numbered entries |
+| `docs/data-layout.md` | The S3 prefix convention and reprocessing semantics | — |
+
+A change flows: decide in `PROJECT_SCOPE.md` → track in `TODO.md` → implement →
+log in `AI_USAGE.md`. Task IDs are never renumbered. When a decision moves from
+open to settled, annotate it in place with a dated **Decided:** line rather than
+rewriting it.
+
+Several open questions (`Q-01` data source, `Q-02` ML target, `Q-08` cadence)
+still block real work. Check §6 before assuming something is undecided by
+accident.
+
+## Commands
+
+Offline checks — these work without AWS credentials:
+
+```bash
+terraform fmt -recursive -check           # from repo root
+terraform -chdir=envs/dev validate
+python3 -m py_compile glue/jobs/*.py
+```
+
+There is no test suite. `validate` plus a compile check is the whole gate.
+
+Needs credentials (SSO tokens here expire often; `plan` failing with
+`InvalidClientTokenId` means the token, not the config):
+
+```bash
+aws sso login --profile <profile>
+terraform -chdir=envs/dev plan
+terraform -chdir=envs/dev output
+```
+
+Running the ETL:
+
+```bash
+JOB=$(terraform -chdir=envs/dev output -raw glue_job_name)
+aws glue start-job-run --job-name "$JOB"
+aws glue start-job-run --job-name "$JOB" --arguments '{"--ingest_date":"2026-08-24"}'
+aws logs tail /aws-glue/jobs/output --follow
+```
+
+## Architecture notes
+
+**Terraform layout.** `envs/dev/` is the root module (per-environment
+directories, not workspaces — D-34); `modules/s3_bucket/` is shared. Within
+`envs/dev`, files split by concern: `main.tf` holds only locals, then `kms.tf`,
+`storage.tf`, `glue.tf`, `iam.tf`.
+
+**Naming.** `<project>-<env>-<component>`, with `local.bucket_suffix` =
+`var.owner` (not the account ID — bucket names are therefore not
+account-scoped and can collide globally). Provider `default_tags` applies
+Project/Environment/ManagedBy/Owner everywhere.
+
+**Three buckets, one per zone** (D-11), so IAM scopes per zone: `raw`
+(versioned, never expires, read-only to the ETL), `processed` (unversioned,
+regenerable), `artifacts` (Glue scripts, temp, Spark logs, later models). All
+SSE-KMS with one customer-managed key — **any new role needs `kms:Decrypt` and
+`kms:GenerateDataKey` on it**, or S3 returns an opaque AccessDenied that looks
+like a bucket-policy problem.
+
+**Prefix layout** (D-12, `docs/data-layout.md`), identical in raw and processed:
+
+```
+<source>/<dataset>/ingest_date=YYYY-MM-DD/<file>
+```
+
+**The ETL contract.** A run is addressed by one date. The job purges the target
+processed partition, then rewrites it, so reruns are idempotent and a backfill is
+the same code path with a different `--ingest_date`. Glue job bookmarks are
+deliberately **off** (revision to D-19) — progress lives in S3, not in service
+state. Consequence: a file landing late into an already-processed partition is
+not picked up automatically; that date must be rerun.
+
+**Glue job scripts** live in `glue/jobs/` and are uploaded by Terraform using
+`source_hash` (not `etag` — KMS-encrypted objects have no MD5 etag, so
+etag-based drift fires on every plan). Editing a script and applying redeploys
+it; the deployed script always matches the commit.
+
+**IAM is written explicitly**, not via `AWSGlueServiceRole`, which grants access
+to `aws-glue-*` buckets we do not own.
+
+**The schedule exists but is disabled.** `etl_schedule_enabled = false` until
+cadence is settled (Q-08) and real data is landing.
+
+## Known temporary state
+
+Both exist only because the real data schema is unknown, and both are closed out
+by **T-2.10** once it is known — do not treat either as the intended design:
+
+- The processed catalog table is created by the Glue sink
+  (`--update_catalog=true`) rather than declared in Terraform, which D-16 calls
+  for.
+- CSV reads use `inferSchema`, which can infer different types for different
+  files. This must not survive contact with production data.
+
+`etl_source_name = "manual"` and `etl_dataset = "sample"` in
+`envs/dev/terraform.tfvars` are placeholders pending Q-01.

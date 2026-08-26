@@ -6,16 +6,23 @@ Raw data lands in **S3**, is transformed by **AWS Glue** ETL jobs, loaded into
 **Amazon Redshift**, and used to train a model in **Amazon SageMaker**, which
 serves predictions from an inference endpoint.
 
-> **Status:** Phase 0 (Terraform foundations) and the raw S3 bucket are written
-> and validated, but not yet applied. Architecture, decisions and build order
-> are in [PROJECT_SCOPE.md](./PROJECT_SCOPE.md).
+> **Status:** Phases 0–1 (Terraform foundations, raw bucket) are applied.
+> Phase 2 (Glue ETL) is written and validated, not yet applied.
+> Architecture and decisions are in [PROJECT_SCOPE.md](./PROJECT_SCOPE.md);
+> progress and next actions are in [TODO.md](./TODO.md).
 
 ## Architecture
 
 ```
 S3 (raw) ──Glue──► S3 (processed) ──COPY──► Redshift ──UNLOAD──► SageMaker ──► inference endpoint
-   ▲
-   └── built
+   ▲          ▲            ▲
+   └── built  └── built    └── built (not applied)
+```
+
+Both data zones share one prefix layout — see [docs/data-layout.md](./docs/data-layout.md):
+
+```
+<source>/<dataset>/ingest_date=YYYY-MM-DD/<file>
 ```
 
 ## How this project is built
@@ -25,16 +32,16 @@ S3 (raw) ──Glue──► S3 (processed) ──COPY──► Redshift ──U
 - **Commits are manual.**
 - Components are built **one at a time**, in the phase order defined in the
   project scope. Each phase is applied and verified before the next begins.
-- **State is local for now** (`envs/dev/terraform.tfstate`, gitignored) and
-  migrates to an S3 backend later — see D-32.
+- **State is local for now** (`envs/dev/terraform.tfstate`, gitignored) and must
+  migrate to an S3 backend before Redshift lands — see D-32 and T-2.9.
 
 ## Requirements
 
 | Tool | Version |
 |---|---|
-| Terraform | >= 1.9.0 (1.9.8 in use; >= 1.10 preferred before the state migration) |
+| Terraform | >= 1.9.0 (1.15.8 in use) |
 | AWS CLI | v2 |
-| AWS credentials | An account with permission to create S3 buckets and KMS keys |
+| AWS credentials | An account with permission to create S3, KMS, IAM, Glue and Scheduler resources |
 
 ## Setup
 
@@ -42,12 +49,13 @@ S3 (raw) ──Glue──► S3 (processed) ──COPY──► Redshift ──U
 git clone <repo-url>
 cd sandbox
 
-# Authenticate to AWS
 aws sso login --profile <your-profile>     # or export AWS_PROFILE / access keys
 aws sts get-caller-identity                # confirm the target account
 ```
 
 ## Usage
+
+### Deploying
 
 ```bash
 cd envs/dev
@@ -56,17 +64,54 @@ terraform init      # first time, and after any module/provider change
 terraform plan      # review before every apply
 terraform apply     # manual, per D-07
 
-terraform output    # bucket name, ARN, KMS key ARN
+terraform output    # bucket names, Glue job name, catalog databases
 ```
 
-Upload a file to the raw bucket:
+### Landing data
 
 ```bash
-aws s3 cp ./data.csv \
-  "s3://$(terraform -chdir=envs/dev output -raw raw_bucket_name)/<source>/<dataset>/ingest_date=$(date +%F)/data.csv"
+RAW=$(terraform -chdir=envs/dev output -raw raw_bucket_name)
+
+aws s3 cp ./customers_20260825.csv \
+  "s3://$RAW/acme_crm/customers/ingest_date=2026-08-25/customers_20260825.csv"
 ```
 
-Tear down:
+### Running the ETL
+
+The job processes one `ingest_date` partition per run. With no arguments it
+picks the most recent partition present:
+
+```bash
+JOB=$(terraform -chdir=envs/dev output -raw glue_job_name)
+
+aws glue start-job-run --job-name "$JOB"
+
+# a specific date — reruns replace that partition rather than duplicating it
+aws glue start-job-run --job-name "$JOB" \
+  --arguments '{"--ingest_date":"2026-08-24"}'
+
+# a different dataset
+aws glue start-job-run --job-name "$JOB" \
+  --arguments '{"--source_name":"acme_crm","--dataset":"customers","--source_format":"csv"}'
+```
+
+Watch a run:
+
+```bash
+aws glue get-job-runs --job-name "$JOB" --max-items 1
+aws logs tail /aws-glue/jobs/output --follow
+```
+
+### Discovering a schema
+
+The raw crawler is on-demand and exists only to answer "what is actually in this
+file". Nothing downstream reads a crawled table.
+
+```bash
+aws glue start-crawler --name "$(terraform -chdir=envs/dev output -raw glue_raw_crawler_name)"
+```
+
+### Tearing down
 
 ```bash
 cd envs/dev
@@ -80,8 +125,9 @@ of what exists. Do not delete it, and do not run applies from two machines.
 ## Tests
 
 ```bash
-terraform fmt -recursive -check   # formatting
-terraform validate                # from within envs/dev
+terraform fmt -recursive -check           # formatting
+terraform -chdir=envs/dev validate        # configuration
+python3 -m py_compile glue/jobs/*.py      # job scripts parse
 ```
 
 ## Project structure
@@ -89,10 +135,22 @@ terraform validate                # from within envs/dev
 ```
 .
 ├── README.md               # this file
+├── CLAUDE.md               # working rules and architecture notes for Claude Code
 ├── PROJECT_SCOPE.md        # architecture, decisions, open questions, build order
+├── TODO.md                 # task tracker, by phase
 ├── AI_USAGE.md             # log of AI prompts and model outputs used to build this
+├── docs/
+│   └── data-layout.md      # S3 prefix layout and reprocessing semantics
+├── glue/
+│   └── jobs/
+│       └── raw_to_processed.py
 ├── envs/
 │   └── dev/                # dev environment root module (local state)
+│       ├── main.tf         # locals
+│       ├── kms.tf          # data lake encryption key
+│       ├── storage.tf      # raw / processed / artifacts buckets
+│       ├── glue.tf         # catalog databases, ETL job, crawler, schedule
+│       └── iam.tf          # Glue job, crawler and scheduler roles
 └── modules/
     └── s3_bucket/          # reusable private, encrypted bucket
 ```

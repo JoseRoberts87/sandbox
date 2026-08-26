@@ -86,6 +86,23 @@ resource "aws_s3_bucket_lifecycle_configuration" "this" {
   }
 
   dynamic "rule" {
+    for_each = { for r in var.expiring_prefixes : r.prefix => r }
+
+    content {
+      id     = "expire-${trim(replace(rule.key, "/", "-"), "-")}"
+      status = "Enabled"
+
+      filter {
+        prefix = rule.key
+      }
+
+      expiration {
+        days = rule.value.days
+      }
+    }
+  }
+
+  dynamic "rule" {
     for_each = var.noncurrent_version_expiration_days == null ? [] : [1]
 
     content {

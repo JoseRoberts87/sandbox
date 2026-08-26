@@ -58,6 +58,15 @@ variable "abort_incomplete_multipart_days" {
   default     = 7
 }
 
+variable "expiring_prefixes" {
+  description = "Per-prefix expiration rules, for transient data such as Glue temp and Spark event logs."
+  type = list(object({
+    prefix = string
+    days   = number
+  }))
+  default = []
+}
+
 variable "tags" {
   description = "Tags merged with the provider's default_tags."
   type        = map(string)
