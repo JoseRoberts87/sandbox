@@ -41,12 +41,49 @@ resource "aws_s3_object" "raw_to_processed_script" {
   }
 }
 
+# --------------------------- security configuration ----------------------------
+# Enforces the encryption mode at the Glue level rather than relying only on the
+# buckets' default encryption.
+#
+# CloudWatch encryption is deliberately DISABLED: encrypting Glue's log group
+# with our CMK also requires a key-policy grant to logs.<region>.amazonaws.com,
+# and getting that wrong silently breaks log delivery for every run. Tracked as
+# T-6.6, to be applied and verified against a real account.
+
+resource "aws_glue_security_configuration" "etl" {
+  # checkov:skip=CKV_AWS_99:Legitimate finding, deliberately deferred — not a
+  # false positive. CKV_AWS_99 requires all three modes encrypted, including
+  # CloudWatch. Doing that needs a KMS key-policy grant to
+  # logs.<region>.amazonaws.com; an incorrect policy silently breaks log
+  # delivery for every job run, and it cannot be verified without applying
+  # against a real account. T-6.6 implements and verifies it, then removes this.
+  name = "${local.name_prefix}-etl"
+
+  encryption_configuration {
+    s3_encryption {
+      s3_encryption_mode = "SSE-KMS"
+      kms_key_arn        = aws_kms_key.s3.arn
+    }
+
+    job_bookmarks_encryption {
+      job_bookmarks_encryption_mode = "CSE-KMS"
+      kms_key_arn                   = aws_kms_key.s3.arn
+    }
+
+    cloudwatch_encryption {
+      cloudwatch_encryption_mode = "DISABLED"
+    }
+  }
+}
+
 # ----------------------------------- the job -----------------------------------
 
 resource "aws_glue_job" "raw_to_processed" {
   name        = "${local.name_prefix}-raw-to-processed"
   description = "Reads one ingest_date partition from raw, writes partitioned Parquet to processed."
   role_arn    = aws_iam_role.glue_job.arn
+
+  security_configuration = aws_glue_security_configuration.etl.name
 
   glue_version      = var.glue_version
   worker_type       = var.glue_worker_type
@@ -116,6 +153,8 @@ resource "aws_glue_crawler" "raw" {
   database_name = aws_glue_catalog_database.raw.name
   table_prefix  = "raw_"
 
+  security_configuration = aws_glue_security_configuration.etl.name
+
   s3_target {
     path = "s3://${module.raw.id}/"
   }
@@ -142,6 +181,7 @@ resource "aws_scheduler_schedule" "raw_to_processed" {
 
   schedule_expression          = var.etl_schedule_expression
   schedule_expression_timezone = "UTC"
+  kms_key_arn                  = aws_kms_key.s3.arn
 
   flexible_time_window {
     mode = "OFF"

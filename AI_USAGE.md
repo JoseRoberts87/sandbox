@@ -378,3 +378,67 @@ Added `CLAUDE.md` to the project structure listing in `README.md`.
 **Notes**
 
 Accepted as-is. No repository rules from other tools existed to fold in.
+
+---
+
+### 007 — pre-commit: fixing what it found
+
+- **Date:** 2026-08-26
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `envs/dev/glue.tf`, `envs/dev/kms.tf`, `envs/dev/versions.tf`, `modules/s3_bucket/{main,versions}.tf`, `CLAUDE.md`, `README.md`, `TODO.md`, `PROJECT_SCOPE.md`
+
+**Prompt**
+
+```text
+i added precommit which you can run using pre-commit run --all-files --verbose
+```
+
+**Output**
+
+First run: `terraform_fmt`, `terraform_validate` and `terraform_tflint` passed;
+`terraform_checkov` failed with 6 findings across 3 distinct checks (120 passed).
+
+**CKV_AWS_300** (×3, "lifecycle configuration sets period for aborting failed
+uploads") — investigated rather than suppressed, because the module *does* set
+`abort_incomplete_multipart_upload`. Read the check's source
+(`S3AbortIncompleteUploads.py`), then confirmed the behaviour empirically with
+two minimal test cases: a lifecycle configuration with only the static abort rule
+**passes**; adding any `dynamic "rule"` block makes the identical abort rule
+**fail**. Verified false positive — suppressed with a `checkov:skip` comment
+recording that evidence.
+
+**CKV_AWS_195** (×2, Glue job and crawler have no security configuration) — a
+real gap, and one previously deferred to phase 6. Added
+`aws_glue_security_configuration` with S3 `SSE-KMS` and job-bookmarks `CSE-KMS`
+using the existing CMK, attached to both the job and the crawler.
+
+**CKV_AWS_297** (×1, EventBridge Scheduler CMK) — real, fixed by setting
+`kms_key_arn` on the schedule. Since the key is no longer S3-only, updated its
+description to match (an in-place update, not a replacement).
+
+That surfaced a fourth check, **CKV_AWS_99**, which requires *all three* Glue
+encryption modes including CloudWatch. Read its source to confirm. Left
+CloudWatch encryption `DISABLED` and suppressed the check, because enabling it
+requires a KMS key-policy grant to `logs.<region>.amazonaws.com` — a change that
+silently breaks log delivery for every job run if wrong, and that cannot be
+verified without applying against a real account. The skip comment states that it
+is a deferred real finding rather than a false positive, and **T-6.6** was added
+to implement, verify, and then remove it.
+
+Also corrected the `required_version` comments in both `versions.tf` files, which
+still claimed Terraform 1.9.8 after the upgrade to 1.15.8.
+
+**Verification run:** `pre-commit run --all-files --verbose` — all four hooks
+**Passed**, checkov 123 passed / 0 failed / 4 skipped.
+
+Updated `CLAUDE.md` (pre-commit is now the gate, plus a rule that any skip must
+carry a reason and a task if the finding is real), `README.md`, `TODO.md` (T-X.4
+closed, T-6.6 added) and the scope changelog.
+
+**Notes**
+
+Accepted as-is, unapplied. The two suppressions are different in kind and are
+labelled as such: CKV_AWS_300 is a tool limitation with reproduction steps
+recorded, CKV_AWS_99 is a genuine gap with a tracked task. Neither should be
+removed without re-checking the reasoning.

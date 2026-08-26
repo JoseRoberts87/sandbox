@@ -53,6 +53,10 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "this" {
+  # checkov:skip=CKV_AWS_300:False positive. The abort rule below is present,
+  # Enabled, and unfiltered. Checkov's CKV_AWS_300 stops matching as soon as the
+  # resource contains any `dynamic "rule"` block — verified by running the check
+  # against this resource with and without the dynamic blocks.
   bucket = aws_s3_bucket.this.id
 
   # Noncurrent-version rules are only meaningful once versioning exists.

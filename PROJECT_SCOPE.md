@@ -453,3 +453,4 @@ state.
 | 2026-08-25 | D-32 decided: local state first, migrate to S3 remote state later. Phase 0 + raw bucket implemented. |
 | 2026-08-25 | Added `TODO.md` — phase-by-phase task tracker keyed to these decisions. |
 | 2026-08-26 | Phase 2 (ETL) built. D-11, D-12, D-17, D-18, D-21, D-38 decided; D-16 and D-20 partially decided pending schema; **D-19 revised** — bookmarks off, in favour of date-addressed idempotent partition rewrites. |
+| 2026-08-26 | `pre-commit` added (fmt, validate, tflint, checkov). Two real findings fixed — Glue security configuration and a CMK on the ETL schedule. Two documented skips: one verified false positive, one deferred to T-6.6. |

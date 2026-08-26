@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------
 
 resource "aws_kms_key" "s3" {
-  description             = "${local.name_prefix} data lake S3 encryption"
+  description             = "${local.name_prefix} data lake encryption (S3, Glue, Scheduler)"
   deletion_window_in_days = var.kms_key_deletion_window_days
   enable_key_rotation     = true
 
