@@ -112,6 +112,7 @@ its turn comes, not before.
 - [ ] **T-6.3** AWS Budget and alarm threshold (D-39)
 - [ ] **T-6.4** Runbooks: backfill, failed load, model rollback
 - [ ] **T-6.5** Teardown procedure that leaves nothing billable
+- [ ] **T-6.6** Encrypt Glue's CloudWatch logs with the CMK: add a key-policy grant for `logs.<region>.amazonaws.com`, flip `cloudwatch_encryption_mode` to `SSE-KMS`, verify log delivery still works, then remove the `CKV_AWS_99` skip in `envs/dev/glue.tf`
 
 ---
 
@@ -120,4 +121,4 @@ its turn comes, not before.
 - [x] **T-X.1** Log every prompt and model output in `AI_USAGE.md`
 - [ ] **T-X.2** Answer Q-01 – Q-09; move each resolved decision from §5 to §4 of the scope
 - [ ] **T-X.3** Keep `PROJECT_SCOPE.md` decisions and changelog current as choices get made
-- [ ] **T-X.4** Add `tflint` / `checkov` to the local check loop — worth it once there is more than one module
+- [x] **T-X.4** `pre-commit` runs `terraform_fmt`, `terraform_validate`, `terraform_tflint` and `terraform_checkov` — all passing

@@ -125,10 +125,11 @@ of what exists. Do not delete it, and do not run applies from two machines.
 ## Tests
 
 ```bash
-terraform fmt -recursive -check           # formatting
-terraform -chdir=envs/dev validate        # configuration
+pre-commit run --all-files --verbose      # fmt, validate, tflint, checkov
 python3 -m py_compile glue/jobs/*.py      # job scripts parse
 ```
+
+No AWS credentials are needed for any of these.
 
 ## Project structure
 

@@ -1,8 +1,7 @@
 terraform {
-  # Installed locally: 1.9.8. Upper bound guards against a 2.x that has not
-  # shipped yet; exact provider reproducibility comes from the committed
-  # .terraform.lock.hcl (D-33).
-  required_version = ">= 1.9.0, < 2.0.0"
+  # Installed locally: 1.15.8. Exact provider reproducibility comes from the
+  # committed .terraform.lock.hcl (D-33).
+  required_version = "~> 1.15"
 
   required_providers {
     aws = {

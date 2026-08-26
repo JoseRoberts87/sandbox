@@ -57,15 +57,27 @@ accident.
 
 ## Commands
 
-Offline checks — these work without AWS credentials:
+The gate is pre-commit, and it needs no AWS credentials:
+
+```bash
+pre-commit run --all-files --verbose      # fmt, validate, tflint, checkov
+python3 -m py_compile glue/jobs/*.py      # not covered by the hooks
+```
+
+There is no test suite. Individual pieces, if you want them directly:
 
 ```bash
 terraform fmt -recursive -check           # from repo root
 terraform -chdir=envs/dev validate
-python3 -m py_compile glue/jobs/*.py
 ```
 
-There is no test suite. `validate` plus a compile check is the whole gate.
+**Two checkov skips are deliberate — do not remove them without doing the work
+they describe.** Each carries its reason inline: `CKV_AWS_300` in
+`modules/s3_bucket/main.tf` is a verified false positive (the check stops
+matching once a resource contains any `dynamic "rule"` block), and `CKV_AWS_99`
+in `envs/dev/glue.tf` is a real finding deferred to T-6.6 because it needs a KMS
+key-policy change that cannot be verified without applying. Any new skip should
+follow that pattern: a reason, and a task if the finding is real.
 
 Needs credentials (SSO tokens here expire often; `plan` failing with
 `InvalidClientTokenId` means the token, not the config):
