@@ -33,17 +33,33 @@ request() {
     -d "$1"
 }
 
+ACCOUNT_ID=$(tf_output account_id)
+ENDPOINT=$(tf_output endpoint_name)
+
 fail=0
 check() {
   local name="$1" expected="$2" payload="$3"
-  local status
+  local status body
   status=$(request "$payload")
+  body=$(cat /tmp/predict_response.json)
+
   if [[ "$status" == "$expected" ]]; then
     echo "  ok    $name -> $status"
   else
     echo "  FAIL  $name -> $status (expected $expected)"; fail=1
   fi
-  sed 's/^/        /' /tmp/predict_response.json; echo
+
+  # A correct status code is not a correct response. This caught a 400 whose
+  # body carried the AWS account id, the endpoint name and a CloudWatch console
+  # URL, passed straight through from the model to an unauthenticated caller.
+  for leak in "$ACCOUNT_ID" "$ENDPOINT" "console.aws.amazon.com" "DOCTYPE" "Traceback"; do
+    if [[ -n "$leak" && "$body" == *"$leak"* ]]; then
+      echo "  FAIL  $name leaked '$leak' in the response body"; fail=1
+    fi
+  done
+
+  echo "        $body"
+  echo
 }
 
 # A serverless endpoint that has scaled to zero answers the first call slowly,
@@ -62,6 +78,8 @@ check "batch of two" 200 \
 check "unseen category values" 200 \
   '{"instances":[{"region":"ANTARCTICA","channel":"carrier-pigeon","category":"unheard-of","quantity":1,"unit_price_usd":10.0,"discount_pct":0.0,"order_dow":0}]}'
 
+# Caught by the proxy, so this never reaches the model — the message names the
+# fields, and nothing from SageMaker's error wrapper appears.
 check "missing required field" 400 '{"instances":[{"region":"EMEA"}]}'
 check "empty instances"        400 '{"instances":[]}'
 check "malformed json"         400 '{not json'

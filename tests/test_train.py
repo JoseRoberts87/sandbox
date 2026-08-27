@@ -62,6 +62,19 @@ class TestFeatureContract:
         expected = set(train.ID_COLUMNS) | set(train.FEATURES) | {train.TARGET}
         assert set(view_select_list()) == expected
 
+    def test_lambda_required_fields_match_the_model(self, train):
+        """The API proxy validates required fields so a bad request never
+        reaches the endpoint. Its list comes from Terraform, so it can drift
+        from the model's — this is the guard."""
+        terraform = (ROOT / "envs" / "dev" / "variables.tf").read_text()
+        block = re.search(
+            r'variable "predict_required_fields".*?default\s*=\s*\[(.*?)\]',
+            terraform, re.S,
+        )
+        assert block, "predict_required_fields not found in variables.tf"
+        declared = re.findall(r'"([a-z_]+)"', block.group(1))
+        assert declared == train.FEATURES
+
     def test_no_feature_is_listed_twice(self, train):
         assert len(train.FEATURES) == len(set(train.FEATURES))
         assert not set(train.CATEGORICAL_FEATURES) & set(train.NUMERIC_FEATURES)

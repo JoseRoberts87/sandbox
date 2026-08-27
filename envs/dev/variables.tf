@@ -219,9 +219,9 @@ variable "redshift_usage_breach_action" {
 }
 
 variable "redshift_enhanced_vpc_routing" {
-  description = "Force S3 traffic through the VPC's gateway endpoint. Keeps COPY/UNLOAD off the managed network; set false to diagnose an S3 or KMS timeout during a load."
+  description = "Force Redshift's S3 traffic through this VPC. Better isolation, but Spectrum then also needs to reach the Glue catalog from inside the VPC, which requires interface endpoints this environment does not have (T-3.14). Leaving it on without them makes external-table reads time out after 30s."
   type        = bool
-  default     = true
+  default     = false
 }
 
 # -------------------------------- sagemaker -----------------------------------
@@ -288,6 +288,20 @@ variable "predict_lambda_reserved_concurrency" {
   default     = 10
 }
 
+variable "predict_required_fields" {
+  description = "Fields every prediction instance must carry. Validated by the Lambda so a bad request never reaches the endpoint. **Must match the model's feature list** in `ml/train.py`; `tests/test_train.py` fails if they diverge."
+  type        = list(string)
+  default = [
+    "region",
+    "channel",
+    "category",
+    "quantity",
+    "unit_price_usd",
+    "discount_pct",
+    "order_dow",
+  ]
+}
+
 variable "predict_max_instances" {
   description = "Maximum rows accepted in one prediction request."
   type        = number
@@ -319,7 +333,7 @@ variable "log_retention_days" {
 }
 
 variable "endpoint_network_isolation" {
-  description = "Cut the inference container off from the network. Correct for this model, which scores in memory. Set false only while diagnosing an endpoint that will not reach InService."
+  description = "Cut the inference container off from the network. **Must stay false while the endpoint is serverless** — CreateEndpointConfig rejects it outright with 'network isolation is not supported for serverless endpoint'. Kept as a variable because it is both supported and correct for a provisioned real-time endpoint, which is the likely move if a latency SLO ever rules out cold starts (D-29)."
   type        = bool
-  default     = true
+  default     = false
 }

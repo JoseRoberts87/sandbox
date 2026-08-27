@@ -59,12 +59,18 @@ accident.
 
 ## Commands
 
+**`make help` lists every command.** The Makefile is the entry point for both
+deployment and the manual steps; prefer it over remembering script paths.
+`make preflight` checks the toolchain and credentials and is the first thing to
+run on an unfamiliar machine. The README's *Without `make`* table maps every
+target to its underlying command — keep it in step when adding a target.
+
 Two gates, neither needing AWS credentials:
 
 ```bash
-pre-commit run --all-files --verbose      # terraform hooks + pytest -m "not spark"
-venv/bin/python -m pytest                 # 96 tests, full suite
-venv/bin/python -m pytest -m "not spark"  # 65 of them, no JVM, ~0.1s
+make check        # pre-commit: terraform fmt/validate/tflint/checkov + fast tests
+make test         # full suite; Spark tests skip without a JVM
+make test-fast    # the no-JVM subset, ~0.1s
 ```
 
 The pre-commit pytest hook must invoke `venv/bin/python -m pytest`, not a bare
@@ -118,14 +124,17 @@ terraform -chdir=envs/dev plan
 terraform -chdir=envs/dev output
 ```
 
-Running the ETL:
+Running the pipeline — each stage is a target, `make data` is all four:
 
 ```bash
-JOB=$(terraform -chdir=envs/dev output -raw glue_job_name)
-aws glue start-job-run --job-name "$JOB"
-aws glue start-job-run --job-name "$JOB" --arguments '{"--ingest_date":"2026-08-24"}'
-aws logs tail /aws-glue/jobs/output --follow
+make land etl migrate load     # DATE=YYYY-MM-DD overrides the partition
+make train promote             # then edit tfvars, make apply
+make verify                    # end-to-end check, reports every failure
 ```
+
+**`make migrate` is not part of `terraform apply`** and is the step most often
+missed — Terraform does not own schema (D-38). `schema "analytics" does not
+exist` means it has not been run.
 
 ## Architecture notes
 

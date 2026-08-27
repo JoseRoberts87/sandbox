@@ -2,348 +2,345 @@
 
 A batch ETL pipeline and ML inference API on AWS, defined entirely in Terraform.
 
-Raw data lands in **S3**, is transformed by **AWS Glue** ETL jobs, loaded into
-**Amazon Redshift**, and used to train a model in **Amazon SageMaker**, which
-serves predictions from an inference endpoint.
-
-> **Status:** All infrastructure through phase 5 is applied. The data path runs
-> end to end as far as the warehouse: raw → Glue → processed → Redshift.
-> Training has not yet run, so no model is deployed and the inference stack is
-> intentionally empty. Architecture and decisions are in
-> [PROJECT_SCOPE.md](./PROJECT_SCOPE.md); progress and next actions are in
-> [TODO.md](./TODO.md).
-
-## Architecture
+Raw CSV lands in **S3**, is cleaned and typed by an **AWS Glue** job, loaded into
+**Amazon Redshift** through Spectrum, and used to train a refund-risk model in
+**SageMaker** that is served from a serverless endpoint behind **API Gateway**.
 
 ```
-S3 (raw) ──Glue──► S3 (processed) ──Spectrum──► Redshift ──UNLOAD──► SageMaker
-                                                                          │
-                                          external caller ──► API Gateway ──► Lambda ──┘
+                                                          ┌─ SageMaker training
+                                                          │        │
+S3 (raw) ──Glue──► S3 (processed) ──Spectrum──► Redshift ──┘   Model Registry
+   CSV              Parquet, partitioned        landing/            │ manual approval
+                                                analytics/          ▼
+                                                ml/         Serverless endpoint
+                                                                    ▲
+                              external caller ──► API Gateway ──► Lambda
 ```
 
-Layout — see [docs/data-layout.md](./docs/data-layout.md):
+> **Status:** Phases 0–5 are deployed and the pipeline runs end to end — a CSV
+> landed in raw comes back out as a calibrated probability from a public API.
+> Phase 6 (alarms, budget, runbooks) has not started.
 
+- **Decisions and open questions:** [PROJECT_SCOPE.md](./PROJECT_SCOPE.md) (`D-##`, `Q-##`)
+- **Task tracker:** [TODO.md](./TODO.md) (`T-##`)
+- **S3 layout and reprocessing semantics:** [docs/data-layout.md](./docs/data-layout.md)
+- **The dataset:** [docs/dataset-takehome-orders.md](./docs/dataset-takehome-orders.md)
+- **Every AI prompt and output:** [AI_USAGE.md](./AI_USAGE.md)
+
+---
+
+## Quick start
+
+Assuming the [toolchain](#1-install-the-toolchain) is installed and the
+[state bucket](#4-create-the-terraform-state-bucket) exists:
+
+```bash
+git clone <repo-url> && cd sandbox
+make install                        # venv, dependencies, pre-commit hooks
+aws sso login --profile <profile>   # or export credentials
+make preflight                      # confirm the toolchain and credentials
+
+make deploy                         # terraform init + apply (prompts)
+make data                           # land → transform → migrate → load
+make model                          # train → approve
+#   paste the printed ARN into envs/dev/terraform.tfvars
+make apply smoke                    # deploy the endpoint and call it
+make verify                         # check the whole thing
 ```
-raw        <source>/<dataset>/<file>
-processed  <source>/<dataset>/ingest_date=YYYY-MM-DD/*.parquet
+
+Starting from nothing, work through [One-time setup](#one-time-setup) first.
+
+`make bootstrap` runs everything up to the manual promotion gate in one go.
+
+Run `make help` for every target.
+
+---
+
+## Prerequisites
+
+| | Tool | Why |
+|---|---|---|
+| **To deploy and run** | `make`, `git` | Every command in this README |
+| | Terraform `~> 1.15` | Pinned in `envs/dev/versions.tf`. Needs ≥ 1.10 for S3-native state locking |
+| | AWS CLI **v2** | Every script shells out to it |
+| | Python 3.11+ | The test suite, and the training script runs locally unchanged |
+| **For `make check`** | `pre-commit` | Installed into the venv by `make install` |
+| | `tflint`, `checkov` | The Terraform hooks shell out to them |
+| **Optional** | A JVM (17) | Only the Spark tests. They skip cleanly without one |
+
+You can deploy and run the whole pipeline without `tflint`, `checkov` or Java.
+They are needed only for the commit gate and the full test suite.
+
+You also need AWS permissions to create S3, KMS, IAM, Glue, VPC, Redshift
+Serverless, SageMaker, Lambda and API Gateway resources.
+
+---
+
+## One-time setup
+
+### 1. Install the toolchain
+
+**macOS**
+
+`make` and `git` ship with the Xcode command line tools, which most macs do not
+have until asked:
+
+```bash
+xcode-select --install
+
+# Homebrew, if you do not have it: https://brew.sh
+brew tap hashicorp/tap
+brew install hashicorp/tap/terraform
+brew install awscli python@3.12 tflint checkov
+
+brew install --cask temurin        # optional — only for the Spark tests
 ```
 
-Raw is flat; a run reads the whole dataset prefix and writes a complete snapshot
-to the `ingest_date` partition for that run. Read the newest partition, not all
-of them.
+**Ubuntu / Debian**
 
-## How this project is built
+```bash
+sudo apt-get update
+sudo apt-get install -y make git curl unzip python3 python3-venv python3-pip
 
-- **Terraform** defines all infrastructure. It is applied **manually** by a
-  developer after reviewing the plan — there is no CI/CD deployment.
-- **Commits are manual.**
-- Components are built **one at a time**, in the phase order defined in the
-  project scope. Each phase is applied and verified before the next begins.
-- **State lives in S3** (`joseroberts87-tf-backend-etl`), with S3-native locking.
-  Running against local state is still supported — see [State](#state).
+# Terraform, from HashiCorp's apt repository
+wget -O- https://apt.releases.hashicorp.com/gpg \
+  | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+  | sudo tee /etc/apt/sources.list.d/hashicorp.list
+sudo apt-get update && sudo apt-get install -y terraform
 
-## Requirements
+# AWS CLI v2 — the apt package is v1, which is not what the scripts expect
+curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+unzip -q awscliv2.zip && sudo ./aws/install && rm -rf aws awscliv2.zip
 
-| Tool | Version |
-|---|---|
-| Terraform | >= 1.9.0 (1.15.8 in use) |
-| AWS CLI | v2 |
-| AWS credentials | An account with permission to create S3, KMS, IAM, Glue and Scheduler resources |
+# The commit-gate linters
+curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+python3 -m pip install --user checkov
 
-## Setup
+sudo apt-get install -y default-jdk    # optional — only for the Spark tests
+```
+
+**Fedora / RHEL / Amazon Linux**
+
+```bash
+sudo dnf install -y make git python3 unzip dnf-plugins-core
+sudo dnf config-manager --add-repo https://rpm.releases.hashicorp.com/fedora/hashicorp.repo
+sudo dnf install -y terraform
+```
+
+Then AWS CLI v2, tflint and checkov exactly as in the Ubuntu block above.
+
+**Windows**
+
+Use **WSL2** and follow the Ubuntu instructions inside it. The scripts here are
+bash and rely on POSIX tooling; native Windows is not a supported path.
+
+```powershell
+wsl --install -d Ubuntu
+```
+
+### 2. Clone and set up the project
 
 ```bash
 git clone <repo-url>
 cd sandbox
-
-aws sso login --profile <your-profile>     # or export AWS_PROFILE / access keys
-aws sts get-caller-identity                # confirm the target account
+make install
 ```
 
-## State
+`make install` creates `venv/`, installs the Python dependencies and
+`pre-commit`, and installs the git hooks.
 
-Terraform state is held remotely by default:
+> **No `make`?** Install it above — it is one package everywhere. If you would
+> rather not, [Without `make`](#without-make) lists the command behind every
+> target.
 
-| | |
-|---|---|
-| Bucket | `joseroberts87-tf-backend-etl` |
-| Key | `envs/dev/terraform.tfstate` |
-| Region | `us-east-1` |
-| Locking | S3-native conditional writes (`use_lockfile`) — no DynamoDB table |
-| Encryption | `encrypt = true` |
-
-The backend is declared in `envs/dev/backend.tf`, deliberately in its own file so
-switching modes is a file-level toggle rather than an edit inside a block.
-
-The state bucket is **not managed by this configuration** — it cannot be, since
-it would hold the state describing itself. Create it once by hand, and make sure
-it has **versioning enabled**: that is the only thing between a corrupted apply
-and an unrecoverable environment. Block public access and enable encryption too.
-
-### Using remote state (default)
+### 3. Authenticate to AWS
 
 ```bash
-cd envs/dev
-terraform init        # first time on a machine, or after changing the backend
-terraform plan
+aws sso login --profile <profile>    # or export AWS_PROFILE / access keys
+aws sts get-caller-identity          # confirm the account you expect
 ```
 
-### Migrating local state to S3 (one time)
+SSO tokens expire often. Later on, a `plan` failing with `InvalidClientTokenId`
+means the token, not the configuration.
+
+### 4. Create the Terraform state bucket
+
+State lives in S3, but **the state bucket is deliberately not managed by this
+configuration** — it cannot hold the state that describes itself. Create it once
+by hand:
 
 ```bash
-cd envs/dev
+aws s3api create-bucket --bucket joseroberts87-tf-backend-etl --region us-east-1
 
-# 1. Keep a copy. If the migration goes wrong this file is the way back.
-cp terraform.tfstate "terraform.tfstate.backup-$(date -u +%Y%m%dT%H%M%SZ)"
+# Versioning is not optional. It is the only recovery path from a corrupted
+# state write.
+aws s3api put-bucket-versioning --bucket joseroberts87-tf-backend-etl \
+  --versioning-configuration Status=Enabled
 
-# 2. Terraform detects the new backend and offers to copy existing state up.
-#    Answer "yes" at the prompt.
-terraform init -migrate-state
-
-# 3. Verify before trusting it: same resources, and nothing to change.
-terraform state list
-terraform plan        # expect "No changes"
-
-# 4. Only then remove the local copies.
-rm -f terraform.tfstate terraform.tfstate.backup
+aws s3api put-public-access-block --bucket joseroberts87-tf-backend-etl \
+  --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
 ```
 
-If step 3 shows resources missing or a plan that wants to recreate things,
-**stop** — restore the backup from step 1 and re-check the bucket, key and region
-before trying again.
+If it already exists, confirm versioning is on. To use local state instead, see
+[State](#state).
 
-### Using local state instead
+> Using a different bucket name means editing `bucket` in
+> `envs/dev/backend.tf`, and the bucket must be in the same region as `region`
+> there.
+
+### 5. Check everything before you deploy
 
 ```bash
-cd envs/dev
-mv backend.tf backend.tf.disabled
-terraform init -migrate-state     # pulls state down into ./terraform.tfstate
+make preflight
 ```
 
-To go back:
+Reports every missing tool with how to install it, flags a Terraform or AWS CLI
+version that will not work, and confirms your credentials and the state bucket.
+Fix anything it marks `missing` before continuing.
+
+---
+
+## Deploy
 
 ```bash
-mv backend.tf.disabled backend.tf
-terraform init -migrate-state
+make deploy          # = terraform init + terraform apply
 ```
 
-`backend.tf.disabled` is gitignored, and `*.tfstate` never gets committed in
-either mode.
-
-### Which to use
-
-Remote for anything shared or real: it survives a lost laptop, it locks so two
-applies cannot race, and it is versioned. Local only for a throwaway environment
-you are willing to lose — with local state, `envs/dev/terraform.tfstate` is the
-single copy of the record of what exists, and applying from a second machine will
-silently diverge.
-
-## Usage
-
-### Deploying
+`apply` **prompts for confirmation and is never auto-approved** — a developer
+reviews the plan (D-07). To look first:
 
 ```bash
-cd envs/dev
-
-terraform init      # first time, and after any module/provider change
-terraform plan      # review before every apply
-terraform apply     # manual, per D-07
-
-terraform output    # bucket names, Glue job name, catalog databases
+make plan
 ```
 
-### Landing data
+This creates everything except the inference stack: buckets, KMS keys, the Glue
+job, the VPC, Redshift Serverless, the SageMaker role and the model registry.
+The endpoint, Lambda and API Gateway stay absent until a model is approved (see
+[Deploy the model](#6-deploy-the-model-two-manual-steps-deliberately)).
 
-Raw is flat: a file goes under its dataset prefix with no date in the path. The
-job derives that prefix from `--source_name` and `--dataset`, so it must match
-`etl_source_name` / `etl_dataset` in `envs/dev/terraform.tfvars`:
+---
 
-```
-<source>/<dataset>/<file>
-```
+## Running the pipeline
 
-For the sample dataset:
+Each stage has its own target, so you can run one or all of them.
 
 ```bash
-scripts/land_sample_data.sh
+make data     # = land + etl + migrate + load
 ```
 
-Anything else, by hand:
+### 1. Land the data
 
 ```bash
-RAW=$(terraform -chdir=envs/dev output -raw raw_bucket_name)
-
-aws s3 cp ./orders_20260826.csv "s3://$RAW/takehome/orders/orders_20260826.csv"
+make land
 ```
 
-### Running the ETL
+Uploads `data/dpe_interview_takehome_data.csv` to
+`s3://<raw>/takehome/orders/`. Raw is flat — no date in the path; the date
+belongs to the *run*. See [docs/data-layout.md](./docs/data-layout.md).
 
-A run reads every file under the dataset prefix and writes a complete snapshot
-to one `ingest_date` partition — today's, unless told otherwise:
+### 2. Transform
 
 ```bash
-JOB=$(terraform -chdir=envs/dev output -raw glue_job_name)
-
-aws glue start-job-run --job-name "$JOB"
-
-# redo the most recent load in place, whatever date it was written under
-aws glue start-job-run --job-name "$JOB" --arguments '{"--ingest_date":"latest"}'
-
-# write a specific partition — reruns of a date replace it rather than duplicating
-aws glue start-job-run --job-name "$JOB" \
-  --arguments '{"--ingest_date":"2026-08-24"}'
-
-# a different dataset
-aws glue start-job-run --job-name "$JOB" \
-  --arguments '{"--source_name":"acme_crm","--dataset":"customers","--source_format":"csv"}'
+make etl                      # write today's snapshot
+make etl DATE=2026-08-24      # write a specific partition
+make etl DATE=latest          # redo the most recent load in place
 ```
 
-Watch a run:
+Starts the Glue job and waits for it. It reads every file under the dataset
+prefix, cleans and types it against the declared schema, and writes Snappy
+Parquet to one `ingest_date` partition.
+
+Rows that fail validation are **quarantined, not dropped**, under
+`_rejected/takehome/orders/…` with a `reject_reason` column. The run fails if
+more than `etl_max_reject_pct` (5%) of rows are rejected. On the sample data
+expect 19 rows in, 19 out, 0 rejected.
+
+### 3. Apply the schema migrations — **manual, and not part of `terraform apply`**
 
 ```bash
-aws glue get-job-runs --job-name "$JOB" --max-items 1
-aws logs tail /aws-glue/jobs/output --follow
+make migrate
 ```
 
-### Testing the job end to end
+Terraform owns infrastructure, not schema (D-38). DDL is ordered files in
+`sql/migrations/`, applied through the Redshift Data API.
+
+> **This step is easy to miss.** `terraform apply` does not create the schemas.
+> If a query returns `schema "analytics" does not exist`, this is why.
+
+Re-runnable: every migration is `CREATE ... IF NOT EXISTS` or
+`CREATE OR REPLACE`.
+
+### 4. Load the warehouse
 
 ```bash
-# 1. Apply — this also uploads the current job script to the artifacts bucket,
-#    so run it after any change to glue/jobs/raw_to_processed.py
-terraform -chdir=envs/dev apply
-
-# 2. Land the sample data at the expected prefix
-scripts/land_sample_data.sh
-
-# 3. Run the job over the partition just landed
-JOB=$(terraform -chdir=envs/dev output -raw glue_job_name)
-RUN=$(aws glue start-job-run --job-name "$JOB" --query JobRunId --output text)
-
-# 4. Watch it
-aws glue get-job-run --job-name "$JOB" --run-id "$RUN" \
-  --query 'JobRun.{State:JobRunState,Error:ErrorMessage}'
-aws logs tail /aws-glue/jobs/output --follow
-
-# 5. Confirm the output landed in the right partition
-PROCESSED=$(terraform -chdir=envs/dev output -raw processed_bucket_name)
-aws s3 ls "s3://$PROCESSED/takehome/orders/" --recursive
-
-# 6. Confirm the catalog table was created
-aws glue get-table \
-  --database-name "$(terraform -chdir=envs/dev output -raw glue_processed_database)" \
-  --name takehome_orders --query 'Table.StorageDescriptor.Columns[].Name'
+make load                     # newest partition present in S3
+make load DATE=2026-08-24     # a specific one
 ```
 
-Expect 19 rows accepted and no rejects. Anything quarantined appears under
-`s3://$PROCESSED/_rejected/takehome/orders/` with a `reject_reason` column, and
-the run fails if more than `etl_max_reject_pct` of rows are rejected.
+Delete-then-insert for one partition, so re-running a date replaces it rather
+than duplicating — the same contract the ETL has with S3.
 
-Rerunning the same date replaces that partition rather than appending, so step 3
-is safe to repeat.
+> **Query `analytics.orders`, never `landing.orders`.** Every partition is a
+> *complete snapshot*, so the table holds each order once per ETL run. The view
+> pins `MAX(ingest_date)` and is what "the orders table" should mean.
 
-> Querying the processed table in Athena needs an Athena workgroup and a results
-> bucket, neither of which exists yet. The `aws glue get-table` check above
-> verifies the catalog without them.
-
-### Loading the warehouse
-
-Terraform creates Redshift but not its schemas (D-38). Apply the migrations once
-after `terraform apply`, then load a snapshot after each ETL run:
+### 5. Train a model
 
 ```bash
-# once — schemas, the Spectrum external schema, landing.orders, analytics.orders
-scripts/redshift_sql.sh sql/migrations
-
-# after each ETL run, for the partition it wrote
-scripts/redshift_sql.sh sql/load_orders.sql ingest_date=$(date -u +%F)
+make train
 ```
 
-The load is `DELETE` + `INSERT ... SELECT` on one partition, so re-running a date
-replaces it rather than duplicating — the same contract the ETL has with S3.
+Unloads `ml.orders_training` to `s3://<artifacts>/training/<version>/`, packages
+`ml/`, runs a SageMaker training job, and registers the result as
+**PendingManualApproval**. Nothing deploys.
 
-Query it:
-
-```bash
-aws redshift-data execute-statement \
-  --workgroup-name "$(terraform -chdir=envs/dev output -raw redshift_workgroup_name)" \
-  --database     "$(terraform -chdir=envs/dev output -raw redshift_database_name)" \
-  --secret-arn   "$(terraform -chdir=envs/dev output -raw redshift_admin_secret_arn)" \
-  --sql "SELECT count(*) AS orders, sum(net_amount_usd) AS net FROM analytics.orders"
-```
-
-> **Query `analytics.orders`, not `landing.orders`.** Every `ingest_date`
-> partition is a full snapshot, so the table holds each order once per run. The
-> view pins the newest snapshot and is what "the orders table" should mean.
-
-> **Cost.** Redshift Serverless is the first component here that bills
-> meaningfully — roughly $0.36 per RPU-hour while queries run, at a floor of 8
-> RPUs. A monthly usage limit of `redshift_monthly_rpu_hours` is set to
-> **deactivate** the workgroup on breach, so a runaway query cannot produce a
-> surprise bill. If queries start failing for no clear reason, check the usage
-> limit before assuming an outage.
-
-### Training a model
-
-Terraform owns the execution role and the registry; producing a model version is
-a script, so a retrain never needs an apply (D-31):
-
-```bash
-scripts/train_model.sh          # version = current UTC timestamp
-```
-
-It unloads `ml.orders_training` to `s3://<artifacts>/training/<version>/`,
-packages `ml/train.py`, runs a SageMaker training job, and registers the result
-as **PendingManualApproval**. Nothing deploys until someone approves it:
-
-```bash
-aws sagemaker update-model-package --model-package-arn <arn> \
-  --model-approval-status Approved
-```
-
-The model predicts **whether an order will end up refunded**, from information
-available when the order is placed. What it learns from — and, more importantly,
-what it must not see — is defined in
+The model predicts whether an order will end up refunded, from what is known
+when the order is placed. What it learns from — and what it must not see — is
+defined in
 [`sql/migrations/005_ml_training_view.sql`](./sql/migrations/005_ml_training_view.sql).
 
-The artifact is a single sklearn `Pipeline` with preprocessing inside it, so
-training and inference share one code path (D-27).
+> On 19 sample rows this scores an ROC AUC around 0.54 — indistinguishable from
+> guessing, and the training script says so itself. The deliverable is the
+> pipeline, not the model.
 
-`ml/train.py` runs unchanged on a laptop, which is how it is tested:
-
-```bash
-venv/bin/python ml/train.py --train <dir-of-csv> --model-dir <out>
-```
-
-> On the sample data this trains on 15 rows and scores an ROC AUC around 0.54 —
-> indistinguishable from guessing, and correctly so. The training script says as
-> much in its own output. The deliverable here is the pipeline, not the model.
-
-### Deploying the model
-
-Two deliberate steps (D-31). Approving says a version is fit to serve; setting
-the ARN is what actually serves it:
+### 6. Deploy the model — **two manual steps, deliberately**
 
 ```bash
-# 1. approve the newest pending version
-scripts/promote_model.sh
-
-# 2. paste the ARN it prints into envs/dev/terraform.tfvars
-#      approved_model_package_arn = "arn:aws:sagemaker:..."
-terraform -chdir=envs/dev apply
+make promote
 ```
 
-The first apply raises the endpoint, the Lambda proxy and the public API.
-Later ones roll the endpoint onto the new version in place. Clearing the ARN
-removes the whole inference stack.
+Approves a registry version. **This deploys nothing.** It prints an ARN; paste
+it into `envs/dev/terraform.tfvars`:
 
-> **Nothing exists until a model is approved.** `approved_model_package_arn`
-> gates the endpoint, the Lambda and the API Gateway, so phase 5 applies cleanly
-> before any model has been trained — it simply creates none of it.
+```hcl
+approved_model_package_arn = "arn:aws:sagemaker:us-east-1:...:model-package/.../1"
+```
 
-### Calling the API
+Then:
 
-A SageMaker endpoint cannot be called from outside AWS, so consumers go through
-API Gateway with an API key (D-30):
+```bash
+make apply
+```
+
+Serving a model is therefore a reviewed diff, not a side effect (D-31). The
+first apply creates the endpoint, the Lambda proxy and the public API; later
+ones roll the endpoint onto a new version in place. Clearing the ARN removes the
+whole inference stack.
+
+### 7. Call it
+
+```bash
+make smoke
+```
+
+Exercises the public path exactly as an external consumer would: valid single
+and batch requests, unseen categorical values, three malformed payloads, and a
+request with no API key.
+
+By hand:
 
 ```bash
 URL=$(terraform -chdir=envs/dev output -raw predict_url)
@@ -351,9 +348,7 @@ KEY=$(aws apigateway get-api-key \
   --api-key "$(terraform -chdir=envs/dev output -raw predict_api_key_id)" \
   --include-value --query value --output text)
 
-curl -X POST "$URL" \
-  -H "x-api-key: $KEY" \
-  -H 'Content-Type: application/json' \
+curl -X POST "$URL" -H "x-api-key: $KEY" -H 'Content-Type: application/json' \
   -d '{"instances":[{"region":"EMEA","channel":"retail","category":"puzzles",
        "quantity":2,"unit_price_usd":30.0,"discount_pct":0.0,"order_dow":3}]}'
 ```
@@ -362,102 +357,293 @@ curl -X POST "$URL" \
 {"predictions": [{"refund_probability": 0.221630}]}
 ```
 
-Verify the whole path end to end:
-
-```bash
-scripts/smoke_test_endpoint.sh
-```
-
-It checks valid single and batch requests, unseen categorical values, three
-malformed payloads, and that a request with no API key is refused.
-
 | Response | Meaning |
 |---|---|
-| `200` | Prediction. One entry per instance, in order |
-| `400` | Your request — malformed JSON, no instances, missing fields, or too many rows |
+| `200` | One prediction per instance, in order |
+| `400` | Your request — malformed JSON, no instances, missing fields, too many rows |
 | `503` | The endpoint scaled to zero and is warming up. Retry |
-| `502` | Our side. The detail is in CloudWatch, deliberately not in the response |
+| `502` | Our side. Detail is in CloudWatch, deliberately not in the response |
 
 > **Cold starts.** The endpoint scales to zero, so the first call after a quiet
-> period takes several seconds and may return 503 before it is ready. That is
-> the trade for an endpoint that costs nothing while idle (D-29).
+> period takes several seconds. That is the trade for costing nothing while idle.
 
-### Discovering a schema
+---
 
-The raw crawler is on-demand and exists only to answer "what is actually in this
-file". Nothing downstream reads a crawled table.
+## Every manual step, in one place
+
+These are the things no target can do for you, and why.
+
+| Step | Why it is manual |
+|---|---|
+| Create the state bucket | It would have to hold the state describing itself |
+| `aws sso login` | Interactive |
+| `terraform apply` | A developer reviews the plan (D-07). Never auto-approved |
+| `make migrate` | Terraform does not own schema (D-38). Automated by `make data`, but never by an apply |
+| Approving a model | A human decides a version is fit to serve (D-31) |
+| Editing `approved_model_package_arn` | Keeps the deployed version in a reviewed diff (D-31) |
+| Committing and pushing | Never done unprompted (D-08) |
+
+---
+
+## Verification
+
+```bash
+make verify
+```
+
+Checks, and reports all failures rather than stopping at the first: Terraform
+outputs resolve and show no drift; raw holds a file; processed has partitions;
+nothing is quarantined; the schemas exist; Spectrum can read the Parquet;
+`analytics.orders` filters to the newest snapshot; model versions exist; the
+endpoint is `InService`; and the cost guards are in place (no NAT gateway,
+schedule disabled, Redshift usage limit set).
+
+Ad-hoc queries:
+
+```bash
+make query SQL="SELECT region, count(*) FROM analytics.orders GROUP BY 1"
+```
+
+Local gates, no AWS needed:
+
+```bash
+make check        # terraform fmt/validate/tflint/checkov + fast tests
+make test         # full suite (Spark tests skip without a JVM)
+make test-fast    # the ~0.1s subset
+```
+
+---
+
+## Day to day
+
+**Reprocess a date.** Both stages are idempotent, so this replaces rather than
+duplicates:
+
+```bash
+make etl DATE=2026-08-24
+make load DATE=2026-08-24
+```
+
+**Land new data and rerun:**
+
+```bash
+aws s3 cp ./new_orders.csv "s3://$(terraform -chdir=envs/dev output -raw raw_bucket_name)/takehome/orders/"
+make etl load
+```
+
+**Retrain and redeploy:**
+
+```bash
+make train promote
+# update approved_model_package_arn, then
+make apply smoke
+```
+
+**Discover the schema of an unfamiliar file:**
 
 ```bash
 aws glue start-crawler --name "$(terraform -chdir=envs/dev output -raw glue_raw_crawler_name)"
 ```
 
-### Tearing down
+The crawler is for exploration only — nothing downstream reads a crawled table.
+
+---
+
+## State
+
+| | |
+|---|---|
+| Bucket | `joseroberts87-tf-backend-etl` |
+| Key | `envs/dev/terraform.tfstate` |
+| Locking | S3-native conditional writes — no DynamoDB table |
+
+Declared in `envs/dev/backend.tf`, in its own file so switching modes is a
+rename rather than an edit inside a block.
+
+**To use local state instead:**
 
 ```bash
 cd envs/dev
-# Buckets must be emptied first unless force_destroy_buckets = true
-terraform destroy
+mv backend.tf backend.tf.disabled
+terraform init -migrate-state
 ```
 
-With remote state, `terraform destroy` is still irreversible for the data in the
-buckets — emptying them is a separate, deliberate act.
+Reverse to go back. `backend.tf.disabled` is gitignored and `*.tfstate` is never
+committed in either mode.
 
-## Tests
+Remote is right for anything shared: it survives a lost laptop, it locks so two
+applies cannot race, and it is versioned. Local is for throwaway work you are
+willing to lose.
+
+---
+
+## Cost
+
+An idle environment costs roughly two KMS keys — a couple of dollars a month.
+What can change that:
+
+| Component | Guard |
+|---|---|
+| **Redshift Serverless** | 8 RPU floor, and a monthly RPU-hour limit set to **deactivate** on breach. If queries suddenly fail, check the usage limit before assuming an outage |
+| **Glue** | Schedule created **disabled** until a cadence is settled (Q-08) |
+| **Inference endpoint** | Serverless — scales to zero, costs nothing idle |
+| **API Gateway** | API key with a daily quota; the endpoint scales with demand, so an unmetered key is an unmetered bill |
+| **Networking** | No NAT gateway. `make verify` checks this |
+
+**Teardown:**
 
 ```bash
-pre-commit run --all-files --verbose      # terraform: fmt, validate, tflint, checkov
-venv/bin/python -m pytest                 # 96 tests: helpers, spec invariants, transform
-venv/bin/python -m pytest -m "not spark"  # 65 of them, no JVM needed, ~0.1s
+make destroy
 ```
 
-No AWS credentials are needed for any of these. The Spark tests need a JVM and
-skip automatically without one.
+Buckets must be emptied first unless `force_destroy_buckets = true`.
 
-Set up the test environment with:
+---
+
+## Troubleshooting
+
+**`schema "analytics" does not exist`**
+The migrations have not been applied. `terraform apply` does not create schemas
+(D-38). Run `make migrate`.
+
+**A load fails with `AwsClientException ... curlError=Connection timeout`**
+The `DELETE` succeeds and the `INSERT ... SELECT` times out after 30 seconds.
+Spectrum could not reach what it needed from inside the VPC. Check
+`redshift_enhanced_vpc_routing` in `terraform.tfvars` — with it on, Spectrum's
+traffic is subject to a VPC that can reach S3 and nothing else, and resolving an
+external table also needs the Glue catalog. It ships **off** for this reason;
+turning it on requires the interface endpoints in T-3.14.
+
+Nothing partial lands: the Data API runs a file's statements in one
+transaction, so a failed `INSERT` rolls the `DELETE` back with it.
+
+**`ValidationException: Redshift endpoint is not available`**
+The workgroup is not `AVAILABLE`. Changing capacity or
+`enhanced_vpc_routing` puts it in `MODIFYING` for several minutes, during which
+it rejects statements. `make migrate`, `make load` and `make query` now wait for
+it; if you hit this from a raw `aws redshift-data` call, check:
 
 ```bash
-python3 -m venv venv
-venv/bin/python -m pip install -r requirements-dev.txt
+aws redshift-serverless get-workgroup \
+  --workgroup-name "$(terraform -chdir=envs/dev output -raw redshift_workgroup_name)" \
+  --query workgroup.status
 ```
+
+If the status is neither `AVAILABLE` nor `MODIFYING`, see the usage-limit note
+below.
+
+**`The network isolation is not supported for serverless endpoint`**
+`endpoint_network_isolation` must stay `false` while the endpoint is serverless
+— the API rejects it outright. It ships `false`; the variable exists only for a
+future provisioned endpoint, where isolation is supported.
+
+**`Cannot create already existing model`**
+The SageMaker model's name is derived from a hash of everything that defines it,
+so a replacement always gets a distinct name. If you add an argument to
+`aws_sagemaker_model`, add it to `local.model_fingerprint` too — otherwise a
+change that forces replacement will not change the name, and the create will
+collide with the model still being destroyed.
+
+If a model was left behind by a failed apply, it is safe to delete once nothing
+references it:
+
+```bash
+aws sagemaker list-models --name-contains refund-risk \
+  --query 'Models[].ModelName'
+aws sagemaker delete-model --model-name <orphan>
+```
+
+**`CloudWatch Logs role ARN must be set in account settings to enable logging`**
+API Gateway will not attach a log destination to a stage until the account has a
+CloudWatch Logs role. This configuration creates one
+(`aws_api_gateway_account`) — note it is an **account-wide, region-wide**
+setting, so destroying this stack disables API Gateway logging for the whole
+account. See T-5.15 before using this in a shared account.
+
+**`InvalidClientTokenId` from `terraform plan`**
+The SSO token expired. `aws sso login --profile <profile>`.
+
+**Queries suddenly fail for no clear reason**
+Check the Redshift usage limit before assuming an outage — it is set to
+**deactivate** the workgroup when the monthly RPU-hour allowance is breached.
+
+```bash
+aws redshift-serverless list-usage-limits --resource-arn "$(aws redshift-serverless \
+  get-workgroup --workgroup-name "$(terraform -chdir=envs/dev output -raw redshift_workgroup_name)" \
+  --query workgroup.workgroupArn --output text)"
+```
+
+**The first API call after a quiet period returns 503**
+The inference endpoint scaled to zero and is warming up. Retry; `make smoke`
+warms it before asserting.
+
+**A Glue run fails**
+The job's own messages are prefixed `[raw_to_processed]`:
+
+```bash
+aws logs tail /aws-glue/jobs/output --log-stream-name-prefix <run-id>
+```
+
+Rows it rejected are under `_rejected/` in the processed bucket with a
+`reject_reason` column.
+
+---
+
+## Without `make`
+
+Every target is a thin wrapper. If you would rather not install `make`, or want
+to see what a target actually does, this is the whole mapping.
+
+| Target | Command |
+|---|---|
+| `preflight` | `bash scripts/preflight.sh` |
+| `install` | `python3 -m venv venv && venv/bin/python -m pip install -r requirements-dev.txt && venv/bin/pre-commit install` |
+| `check` | `venv/bin/pre-commit run --all-files` |
+| `test` | `venv/bin/python -m pytest` |
+| `test-fast` | `venv/bin/python -m pytest -m "not spark"` |
+| `fmt` | `terraform fmt -recursive` |
+| `init` | `terraform -chdir=envs/dev init` |
+| `plan` | `terraform -chdir=envs/dev plan` |
+| `apply` | `terraform -chdir=envs/dev apply` |
+| `output` | `terraform -chdir=envs/dev output` |
+| `destroy` | `terraform -chdir=envs/dev destroy` |
+| `land` | `bash scripts/land_sample_data.sh` |
+| `etl` | `bash scripts/run_etl.sh [DATE]` |
+| `migrate` | `bash scripts/redshift_sql.sh sql/migrations` |
+| `load` | `bash scripts/load_warehouse.sh [DATE]` |
+| `train` | `bash scripts/train_model.sh` |
+| `promote` | `bash scripts/promote_model.sh` |
+| `smoke` | `bash scripts/smoke_test_endpoint.sh` |
+| `verify` | `bash scripts/verify.sh` |
+| `query` | `bash scripts/redshift_query.sh "SELECT ..."` |
+| `clean` | `rm -rf .pytest_cache envs/dev/.terraform/predict_lambda.zip` and `__pycache__` dirs |
+
+The composites are just sequences:
+
+| Target | Runs |
+|---|---|
+| `deploy` | `init` then `apply` |
+| `data` | `land`, `etl`, `migrate`, `load` |
+| `model` | `train` then `promote` |
+| `bootstrap` | `deploy`, `data`, `model`, then stops at the promotion gate |
+
+---
 
 ## Project structure
 
 ```
-.
-├── README.md               # this file
-├── CLAUDE.md               # working rules and architecture notes for Claude Code
-├── PROJECT_SCOPE.md        # architecture, decisions, open questions, build order
-├── TODO.md                 # task tracker, by phase
-├── AI_USAGE.md             # log of AI prompts and model outputs used to build this
-├── docs/
-│   └── data-layout.md      # S3 prefix layout and reprocessing semantics
-├── glue/
-│   └── jobs/
-│       └── raw_to_processed.py
-├── tests/                  # pytest: helpers, spec invariants, Spark transform
-├── data/                   # sample source data
-├── scripts/                # land_sample_data.sh, redshift_sql.sh
-├── sql/                    # Redshift DDL migrations, partition load, UNLOAD
-├── ml/                     # train.py, inference.py — run locally and in SageMaker
-├── lambda/predict/         # API Gateway -> SageMaker proxy
-├── envs/
-│   └── dev/                # dev environment root module
-│       ├── backend.tf      # remote state; remove this file to go local
-│       ├── main.tf         # locals
-│       ├── kms.tf          # data lake encryption key
-│       ├── storage.tf      # raw / processed / artifacts buckets
-│       ├── glue.tf         # catalog databases, ETL job, crawler, schedule
-│       ├── network.tf      # VPC for Redshift; no NAT by design
-│       ├── redshift.tf     # Serverless namespace, workgroup, usage limit
-│       ├── sagemaker.tf    # execution role, model registry
-│       ├── inference.tf    # endpoint (gated on an approved model)
-│       ├── api.tf          # Lambda proxy, API Gateway, key and quota
-│       └── iam.tf          # Glue job, crawler and scheduler roles
-└── modules/
-    └── s3_bucket/          # reusable private, encrypted bucket
+Makefile                    every command; `make help` lists them
+envs/dev/                   the root module — one directory per environment
+  backend.tf                remote state; remove this file to go local
+  main.tf kms.tf storage.tf glue.tf iam.tf
+  network.tf redshift.tf sagemaker.tf inference.tf api.tf
+modules/s3_bucket/          private, encrypted bucket used for all three zones
+glue/jobs/                  the PySpark ETL job
+ml/                         train.py and inference.py — run locally and in SageMaker
+lambda/predict/             API Gateway → SageMaker proxy
+sql/                        migrations, the partition load, the training UNLOAD
+scripts/                    the manual steps, scripted (see the table above)
+tests/                      pytest: helpers, spec invariants, transform, model, proxy
+data/                       the sample dataset
+docs/                       data layout and dataset documentation
 ```
-
-## AI usage
-
-This project was built with AI assistance. Every prompt issued and a record of
-the corresponding model output is logged in [AI_USAGE.md](./AI_USAGE.md).

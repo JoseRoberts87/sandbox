@@ -17,30 +17,63 @@
 locals {
   inference_enabled = var.approved_model_package_arn != ""
 
-  # Ties the model resource to the exact approved version, so a new approval
-  # rolls the endpoint instead of silently leaving the old model serving.
+  # A short, stable fingerprint of the approved version, carried as a tag so a
+  # running endpoint can be traced back to the registry version it serves.
   model_version_suffix = local.inference_enabled ? substr(sha1(var.approved_model_package_arn), 0, 8) : ""
+
+  # Every argument the model resource sets. The name is derived from this so a
+  # replacement always gets a distinct name — see the note on the resource.
+  model_fingerprint = substr(sha1(jsonencode([
+    var.approved_model_package_arn,
+    var.endpoint_network_isolation,
+    aws_iam_role.sagemaker.arn,
+  ])), 0, 8)
 }
 
 resource "aws_sagemaker_model" "refund_risk" {
+  # checkov:skip=CKV_AWS_370:Not available on Serverless Inference.
+  # CreateEndpointConfig fails with "The network isolation is not supported for
+  # serverless endpoint" — this is an API-level incompatibility, not a choice.
+  # The container reaches nothing anyway: the pipeline scores in memory, and the
+  # execution role grants S3 and ECR only. Revisit if D-29 is ever revised to a
+  # provisioned endpoint, where isolation is supported and worth having.
   count = local.inference_enabled ? 1 : 0
 
-  name               = "${local.name_prefix}-refund-risk-${local.model_version_suffix}"
+  # The name carries a fingerprint of everything that defines this model.
+  #
+  # SageMaker models are wholly immutable, so any change replaces the resource.
+  # The endpoint configuration below sets create_before_destroy, and Terraform
+  # propagates that to resources it depends on when those also need replacing —
+  # so the replacement is created *before* the original is destroyed. With a
+  # name that did not change, CreateModel failed with "Cannot create already
+  # existing model". Deriving the name from the definition means the old and new
+  # models can coexist for the moment the swap takes.
+  #
+  # `aws_sagemaker_model` has no name_prefix argument, which is the usual way to
+  # get this. If you add an argument to this resource, add it to the hash too.
+  name               = "${local.name_prefix}-refund-risk-${local.model_fingerprint}"
   execution_role_arn = aws_iam_role.sagemaker.arn
 
-  # The pipeline scores a row in memory and needs no network access, so cut it
-  # off. SageMaker still stages the artifact before the container starts.
-  # Behind a variable because if an endpoint ever fails to reach InService,
-  # this is the first thing to flip while diagnosing.
+  # False, and not negotiable while the endpoint is serverless — see the skip
+  # above. The variable exists for a future provisioned endpoint.
   enable_network_isolation = var.endpoint_network_isolation
 
   primary_container {
     model_package_name = var.approved_model_package_arn
   }
 
+  # Made explicit rather than left to propagation, so the reason above is not
+  # silently undone by someone removing it from the endpoint configuration.
+  lifecycle {
+    create_before_destroy = true
+  }
+
   tags = {
     Name      = "${local.name_prefix}-refund-risk"
     Component = "ml"
+
+    # Which registry version a running endpoint is actually serving.
+    ModelPackageVersion = local.model_version_suffix
   }
 }
 

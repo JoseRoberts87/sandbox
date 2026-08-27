@@ -25,7 +25,7 @@ if [[ -z "$PACKAGE_ARN" ]]; then
     --model-package-group-name "$GROUP" \
     --model-approval-status PendingManualApproval \
     --sort-by CreationTime --sort-order Descending \
-    --max-results 1 --query 'ModelPackageSummaryList[0].ModelPackageArn' --output text)
+    --max-results 1 --query 'ModelPackageSummaryList[0].ModelPackageArn' --output text) || PACKAGE_ARN=""
 
   if [[ -z "$PACKAGE_ARN" || "$PACKAGE_ARN" == "None" ]]; then
     echo "error: no PendingManualApproval versions in $GROUP. Run scripts/train_model.sh first." >&2

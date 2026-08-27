@@ -17,8 +17,54 @@ SQL="${1:-}"
 
 tf_output() { terraform -chdir=envs/dev output -raw "$1" 2>/dev/null; }
 
+# A workgroup that is CREATING or MODIFYING rejects statements with
+# "Redshift endpoint is not available", which says nothing about waiting.
+# Changing capacity or enhanced_vpc_routing puts it in MODIFYING for minutes.
+wait_for_workgroup() {
+  local name="$1" waited=0 status announced=0
+
+  while true; do
+    status=$(aws redshift-serverless get-workgroup --workgroup-name "$name" \
+      --query workgroup.status --output text 2>/dev/null) || status=UNKNOWN
+
+    case "$status" in
+      AVAILABLE)
+        [[ "$announced" -eq 1 ]] && echo "  workgroup available"
+        return 0
+        ;;
+      CREATING|MODIFYING)
+        if [[ "$announced" -eq 0 ]]; then
+          echo "workgroup is $status — waiting up to 10 minutes"
+          announced=1
+        fi
+        ;;
+      *)
+        cat >&2 <<MSG
+error: workgroup $name is $status, not AVAILABLE.
+
+If it was just modified, wait and retry. If queries were working and suddenly
+are not, check the usage limit before assuming an outage — it is set to
+deactivate the workgroup when the monthly RPU-hour allowance is breached:
+
+  make verify
+MSG
+        return 1
+        ;;
+    esac
+
+    waited=$((waited + 10))
+    if [[ "$waited" -ge 600 ]]; then
+      echo "error: workgroup still $status after 10 minutes" >&2
+      return 1
+    fi
+    sleep 10
+  done
+}
+
 WORKGROUP=$(tf_output redshift_workgroup_name) || {
   echo "error: could not read terraform outputs. Is phase 3 applied?" >&2; exit 1; }
+
+wait_for_workgroup "$WORKGROUP" || exit 1
 
 ID=$(aws redshift-data execute-statement \
   --workgroup-name "$WORKGROUP" \

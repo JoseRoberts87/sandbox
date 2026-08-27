@@ -11,6 +11,10 @@
 pytest==9.1.1
 pyspark==4.2.0
 
+# The commit gate. Installed here so the venv is self-contained; the terraform
+# hooks still need terraform, tflint and checkov on PATH (see the README).
+pre-commit==4.6.2
+
 # Phase 4. ml/train.py runs unchanged on a laptop and inside the SageMaker
 # scikit-learn container, so the training logic is testable without AWS.
 scikit-learn==1.9.0

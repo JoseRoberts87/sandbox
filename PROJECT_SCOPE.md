@@ -355,6 +355,8 @@ switch to provisioned real-time if a latency SLO makes cold starts unacceptable.
 
 **Decided (2026-08-27):** Serverless Inference, 2048 MB, max concurrency 5. It scales to zero, so an idle environment costs nothing — the deciding factor, since a provisioned real-time endpoint would have become the largest standing cost in the project while serving no traffic. The trade is a cold start of several seconds after inactivity; the Lambda proxy translates that into a `503 model endpoint is warming up, please retry` rather than an opaque 500.
 
+Serverless also gives up two hardening options that a provisioned endpoint has, both rejected at the API rather than merely unset: **network isolation** on the model, and a **KMS key** on the endpoint configuration (there is no attached volume to encrypt). Neither is a real exposure here — the container scores in memory and its role grants S3 and ECR only — but both are worth revisiting if this ever moves to a provisioned endpoint.
+
 **D-30 — Endpoint exposure and auth.** A SageMaker endpoint is not publicly
 callable — every request must be SigV4-signed with IAM credentials. So: do
 consumers assume an IAM role and call `InvokeEndpoint` directly, or do we front it
@@ -369,6 +371,17 @@ shaping?
 The quota matters more than it looks: the endpoint scales with demand, so an unmetered key is an unmetered bill.
 
 The proxy returns 400 for input the caller can fix — including passing through the model's own "missing required fields" message — and 502 with no detail for anything internal. An external caller should never learn a role ARN from an error.
+
+**A `ModelError` is never echoed to the caller.** SageMaker wraps whatever the
+container returns, and that wrapper carries the AWS account id, the endpoint
+name and a CloudWatch console URL. The proxy therefore validates required fields
+itself — a bad request gets a clean 400 naming the fields and never wakes the
+endpoint — and anything the model still rejects returns a generic message with
+the detail logged rather than returned. This was a real leak, found by the smoke
+test only after the smoke test was taught to check response bodies rather than
+status codes.
+
+**One thing this drags in:** API Gateway will not attach a log destination to a stage unless the *account* has a CloudWatch Logs role configured, so this stack now owns `aws_api_gateway_account` — an account-wide, region-wide setting. That is a larger blast radius than anything else here: destroying it disables logging for every API in the account. Acceptable in a dedicated account, wrong in a shared one, and it belongs in a bootstrap configuration alongside the state bucket before this is used anywhere else (T-5.15).
 
 **D-31 — Retraining and promotion.** Terraform pinning the endpoint to a specific
 model artifact means every retrain is a `terraform apply` — which keeps the
@@ -447,7 +460,7 @@ and **no NAT gateway** unless something proves it needs one — a NAT gateway is
 constant hourly charge in an environment designed to idle at near-zero. Prefer
 interface endpoints for the specific services that need them.
 
-**Decided (2026-08-27):** a VPC that exists only because Redshift Serverless demands one — three private subnets, an S3 gateway endpoint, **no internet gateway and no NAT**, and a security group with no ingress whatsoever (the Data API is an AWS API call, not VPC traffic). Egress is restricted to the S3 prefix list. `enhanced_vpc_routing` is on, so S3 traffic uses the endpoint; it is behind a variable because it is the first thing to suspect if a load fails with an opaque S3 or KMS timeout.
+**Decided (2026-08-27):** a VPC that exists only because Redshift Serverless demands one — three private subnets, an S3 gateway endpoint, **no internet gateway and no NAT**, and a security group with no ingress whatsoever (the Data API is an AWS API call, not VPC traffic). Egress is restricted to the S3 prefix list. `enhanced_vpc_routing` was on initially and is now **off** — the prediction that it would be the first suspect in an opaque timeout proved right on the first real load. With it on, Spectrum's traffic is subject to a VPC whose only egress is the S3 prefix list, and resolving an external table also requires the Glue catalog, which had nowhere to go. Restoring it means interface endpoints at roughly $60/month across three AZs, which is hard to justify here (T-3.14).
 
 **D-38 — Terraform's boundary.** Terraform owns infrastructure. It does **not**
 own: data in S3, rows in Redshift, model artifacts, or in-flight job runs. Two
@@ -508,21 +521,22 @@ starts before the previous phase is applied and verified.
 Detailed task breakdowns for each phase come later, one phase at a time.
 Live progress against these phases is tracked in [TODO.md](./TODO.md).
 
-**Current status (2026-08-27):** All infrastructure through phase 5 is applied.
+**Current status (2026-08-27):** Phases 0–5 are deployed and the pipeline runs
+end to end. A CSV landed in raw is cleaned and typed by Glue, written as
+partitioned Parquet, loaded into Redshift through Spectrum, unloaded as a
+versioned training set, trained into a registered model version, approved, and
+served from a serverless endpoint behind an API-key-protected public API that
+returns a calibrated probability. `make smoke` passes every case, including
+malformed input and a request with no key.
 
-The data path is proven as far as the **processed zone**: the Glue job runs and
-is idempotent on rerun (T-2.14). The warehouse itself is empty — querying it on
-2026-08-27 returned `schema "analytics" does not exist`, so the migrations
-(T-3.7) never applied and no snapshot has been loaded (T-3.8). Both were
-reopened. `terraform apply` does not run migrations by design (D-38); they are a
-separate deliberate step and were missed.
+Phase 6 has not started: there are no alarms, no budget, and no runbooks. The
+Redshift usage limit is the only automatic spend guard, and it covers Redshift
+alone.
 
-Everything from the warehouse onward is therefore unexercised. The inference
-stack is deliberately absent while `approved_model_package_arn` is empty.
-
-Still unverified: that a repeated load does not double rows (T-3.9), and that
-`analytics.orders` returns only the newest snapshot (T-3.10). Both are
-properties the design depends on rather than incidental details.
+Two warehouse properties the design depends on remain unverified, because both
+need a second load to observe at all: that a repeated load does not double rows
+(T-3.9), and that `analytics.orders` returns only the newest snapshot
+(T-3.10).
 
 ---
 
@@ -555,3 +569,9 @@ properties the design depends on rather than incidental details.
 | 2026-08-27 | Phase 3 built: VPC (3 AZs, no NAT), Redshift Serverless with a usage limit, IAM, `sql/` migrations and a Data API runner. D-22, D-24, D-25, D-37 decided; D-38's Redshift half decided; **D-23 revised** — Spectrum + `INSERT ... SELECT` instead of `COPY`, because COPY cannot populate a partition column. |
 | 2026-08-27 | Phase 4 built. **Q-02 answered** — refund-risk classification. D-26, D-27, D-28 decided; D-31 partially. Training verified end to end locally against the real sample data through the actual Spark transform. |
 | 2026-08-27 | Phase 5 built. **Q-03 and Q-04 answered**; D-29, D-30, D-31 decided. Serverless endpoint behind API Gateway + a Lambda proxy, all gated on an approved model version. A CloudWatch Logs KMS key was added, which is the hard half of T-6.6. |
+| 2026-08-27 | `Makefile` added, plus `run_etl.sh`, `load_warehouse.sh` and `verify.sh`. README restructured as a linear install-and-run guide with every manual step listed and justified. Automation deliberately stops short of `apply -auto-approve` (D-07) and of editing `approved_model_package_arn` (D-31). |
+| 2026-08-27 | README made complete from a clean machine: toolchain install per platform, `make preflight`, and a no-`make` fallback. `pre-commit` moved into the venv so `make install` yields a working gate. |
+| 2026-08-27 | First real warehouse load failed: Spectrum could not reach the Glue catalog with `enhanced_vpc_routing` on and S3-only egress. Turned off; D-37 amended and T-3.14 opened. |
+| 2026-08-27 | Endpoint creation failed: network isolation is not supported on Serverless Inference. Default flipped to false; D-29 amended with what serverless gives up. |
+| 2026-08-27 | Endpoint reached InService. API Gateway stage needed an account-level CloudWatch Logs role — added, with the account-wide blast radius recorded (T-5.15). |
+| 2026-08-27 | **Pipeline runs end to end**: raw CSV → Glue → Parquet → Redshift → training → registry → endpoint → public API. Smoke test green. Fixed an information leak found by it: SageMaker's `ModelError` wrapper carries the account id and a console URL, and the proxy was passing it to callers. |

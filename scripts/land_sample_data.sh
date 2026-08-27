@@ -14,21 +14,25 @@
 
 set -euo pipefail
 
-SOURCE_NAME="takehome"
-DATASET="orders"
 FILE="data/dpe_interview_takehome_data.csv"
 
 cd "$(dirname "$0")/.."
+
+tf_output() { terraform -chdir=envs/dev output -raw "$1" 2>/dev/null; }
 
 if [[ ! -f "$FILE" ]]; then
   echo "error: $FILE not found" >&2
   exit 1
 fi
 
-if ! RAW_BUCKET=$(terraform -chdir=envs/dev output -raw raw_bucket_name 2>/dev/null); then
-  echo "error: could not read raw_bucket_name. Is phase 1 applied, and are AWS credentials valid?" >&2
+if ! RAW_BUCKET=$(tf_output raw_bucket_name); then
+  echo "error: could not read terraform outputs. Is the stack applied, and are AWS credentials valid?" >&2
   exit 1
 fi
+
+# From tfvars, so the landing path cannot drift from what the job reads.
+SOURCE_NAME=$(tf_output etl_source_name)
+DATASET=$(tf_output etl_dataset)
 
 KEY="$SOURCE_NAME/$DATASET/$(basename "$FILE")"
 
