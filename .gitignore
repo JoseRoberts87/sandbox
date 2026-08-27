@@ -25,6 +25,10 @@ override.tf.json
 *_override.tf
 *_override.tf.json
 
+# Local-state toggle: renaming backend.tf disables the remote backend for one
+# working copy. That choice is personal, not a repo-wide decision.
+backend.tf.disabled
+
 # NOTE: .terraform.lock.hcl IS committed on purpose (D-33 — provider pinning).
 # NOTE: envs/*/terraform.tfvars IS committed on purpose — it holds non-secret
 #       config only. Never put credentials in it.

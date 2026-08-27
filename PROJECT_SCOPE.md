@@ -355,18 +355,29 @@ the swap is worth deciding explicitly rather than by accident.
 
 ### Terraform and platform
 
-**D-32 — State backend.** **Decided: start with local state, migrate to S3
-later.** Local state avoids the bootstrap problem entirely for the first deploy
-— the state bucket cannot manage its own creation — and keeps the first apply to
-a single command. The commented backend block in `envs/dev/versions.tf` holds the
-migration path (`terraform init -migrate-state`).
+**D-32 — State backend.** **Done (2026-08-27): state is in S3.**
 
-Two things to settle before migrating: native S3 lockfiles (`use_lockfile`)
-require Terraform >= 1.10 and the installed version is 1.9.8, so migrating today
-means a DynamoDB lock table that we would later remove — upgrading Terraform
-first is the cheaper order. And local state must not outlive Phase 3: the moment
-Redshift exists, state contains sensitive values and a laptop is the wrong place
-for the only copy. Migrate at the end of Phase 2 at the latest.
+```
+bucket  joseroberts87-tf-backend-etl
+key     envs/dev/terraform.tfstate
+lock    S3-native conditional writes (use_lockfile) — no DynamoDB table
+```
+
+Local state got us through phases 0–2 without the bootstrap problem — the state
+bucket cannot manage its own creation — and remote state arrived before Redshift,
+which was the deadline that mattered: from phase 3 on, state contains secrets and
+a laptop is the wrong place for the only copy.
+
+The Terraform upgrade (T-0.10) paid off here: `use_lockfile` needs >= 1.10, so
+there is no DynamoDB lock table to create now or remove later.
+
+The bucket is created by hand and is deliberately outside Terraform's ownership.
+It must have versioning enabled — that is the only recovery path from a corrupted
+state write.
+
+Local state remains supported for throwaway work: `envs/dev/backend.tf` holds the
+backend on its own, so removing the file and re-initialising switches modes. The
+README documents both directions.
 
 **D-33 — Version pinning.** Pin `required_version` for Terraform and a `~>`
 constraint on the AWS provider, with `.terraform.lock.hcl` committed. Manual
@@ -487,3 +498,4 @@ state.
 | 2026-08-26 | Real dataset arrived. `takehome/orders` schema and cleaning rules declared in the job; `inferSchema` demoted to a fallback. D-20 extended: row-level failures are quarantined to `_rejected/` with a reason and a reject-rate threshold, rather than failing the batch. Q-01 partially answered. |
 | 2026-08-26 | pytest suite added (96 tests). It caught two implicit runtime dependencies in the job: ANSI mode (a failed cast throws rather than nulling, which would abort a batch and defeat quarantine entirely) and session timezone (date bucketing able to shift a day). Both are now set explicitly in `configure_session()`. |
 | 2026-08-27 | D-12 revised: raw is flat (`<source>/<dataset>/<file>`), processed stays partitioned by `ingest_date` = the run date. Processed partitions are now full snapshots, so consumers read the newest one. `--ingest_date` defaults to `today`; `latest` now resolves against processed, to redo the most recent load. |
+| 2026-08-27 | D-32 closed: state migrated to S3 (`joseroberts87-tf-backend-etl`) with S3-native locking, no DynamoDB. Backend isolated in `backend.tf` so local state stays available for throwaway work. |

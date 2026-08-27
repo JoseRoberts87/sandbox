@@ -26,9 +26,11 @@ than asking.
   the top of that file: verbatim prompt, substance of the output, and a Notes
   line saying whether it was accepted, modified or rejected. Entries are
   append-only and numbered.
-- **State is local** (`envs/dev/terraform.tfstate`, gitignored) and is the only
-  record of what exists. Do not delete it. It must migrate to S3 before Redshift
-  lands — tracked as T-2.9, because state will then contain secrets.
+- **State is remote**, in `joseroberts87-tf-backend-etl` with S3-native locking.
+  The backend is declared in `envs/dev/backend.tf`; removing that file switches a
+  working copy to local state (`terraform init -migrate-state`). The state bucket
+  is not managed by this configuration and must keep versioning enabled. Never
+  commit a `*.tfstate`, in either mode.
 - **Record deviations from the scope; do not make them quietly.** When
   implementation diverges from a decision, update that decision in
   `PROJECT_SCOPE.md` with the reasoning and trade-off, and add a task to close it
