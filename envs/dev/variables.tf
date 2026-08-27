@@ -223,3 +223,23 @@ variable "redshift_enhanced_vpc_routing" {
   type        = bool
   default     = true
 }
+
+# -------------------------------- sagemaker -----------------------------------
+
+variable "sagemaker_training_image" {
+  description = "Managed scikit-learn training image. Region-specific — verify before the first run with `sagemaker.image_uris.retrieve(framework='sklearn', region=..., version='1.2-1')`. A wrong URI fails create-training-job immediately, so it is cheap to get wrong."
+  type        = string
+  default     = "683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-scikit-learn:1.2-1"
+}
+
+variable "sagemaker_training_instance_type" {
+  description = "Training instance. The dataset is tiny; this is the smallest sensible general-purpose option."
+  type        = string
+  default     = "ml.m5.large"
+}
+
+variable "sagemaker_max_runtime_seconds" {
+  description = "Hard stop on a training run, so a hung job cannot bill for hours."
+  type        = number
+  default     = 900
+}

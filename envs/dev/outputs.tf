@@ -97,3 +97,28 @@ output "redshift_endpoint" {
   description = "Workgroup endpoint. Unused while everything goes through the Data API."
   value       = try(aws_redshiftserverless_workgroup.main.endpoint[0].address, null)
 }
+
+output "sagemaker_role_arn" {
+  description = "SageMaker execution role, for training jobs and endpoints."
+  value       = aws_iam_role.sagemaker.arn
+}
+
+output "sagemaker_model_package_group" {
+  description = "Model Registry group. New versions register as PendingManualApproval (D-31)."
+  value       = aws_sagemaker_model_package_group.refund_risk.model_package_group_name
+}
+
+output "sagemaker_training_image" {
+  description = "Managed container used for training."
+  value       = var.sagemaker_training_image
+}
+
+output "sagemaker_training_instance_type" {
+  description = "Instance type used for training runs."
+  value       = var.sagemaker_training_instance_type
+}
+
+output "sagemaker_max_runtime_seconds" {
+  description = "Training job timeout."
+  value       = var.sagemaker_max_runtime_seconds
+}

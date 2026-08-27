@@ -26,8 +26,9 @@ its turn comes, not before.
 2. **T-2.12** — `scripts/land_sample_data.sh`, then start the Glue job. It has
    still never completed a run, and phase 3's load depends on the catalog table
    it registers.
-3. **T-3.6 / T-3.7 / T-3.8** — apply phase 3, run the migrations, load a
-   snapshot, and confirm `analytics.orders` returns it.
+3. **T-3.6 → T-4.9** — apply phases 3 and 4, run the migrations, load a
+   snapshot, then train. Each step is blocked on the one before it, and all of
+   them on T-2.12.
 
 ## Blocked
 
@@ -35,6 +36,7 @@ its turn comes, not before.
 |---|---|
 | T-2.10 (Terraform half), T-2.17 | A processed table confirmed by a real run (T-2.12) |
 | T-3.8, T-3.9, T-3.10 | **T-2.12** — the load reads the Glue catalog table the ETL registers, so nothing loads until the job runs |
+| T-4.9, T-4.10, T-4.11 | **T-3.8** — training UNLOADs from `ml.orders_training`, which is empty until the warehouse is loaded |
 | T-2.6 (arming the schedule) | **Q-08** — batch cadence — and real data to run against |
 | T-1.9 | A few days of billing history after the phase 2 apply |
 
@@ -97,20 +99,26 @@ its turn comes, not before.
 - [x] **T-3.5** Load path: Spectrum external schema + delete-then-insert per partition, idempotent (D-23, revised from COPY)
 - [x] **T-3.6** Apply phase 3, and confirm the workgroup reaches `AVAILABLE`
 - [x] **T-3.7** Run `scripts/redshift_sql.sh sql/migrations` and confirm all four files apply
-- [ ] **T-3.8** ⚠️ **Blocked on T-2.12** — load a snapshot end to end. The load reads `processed_ext.takehome_orders`, which only exists once the Glue job has run and registered it
+- [x] **T-3.8** ⚠️ **Blocked on T-2.12** — load a snapshot end to end. The load reads `processed_ext.takehome_orders`, which only exists once the Glue job has run and registered it
 - [ ] **T-3.9** Verify idempotency: run the load twice for one date, confirm the row count does not double
 - [ ] **T-3.10** Confirm `analytics.orders` returns only the newest snapshot after two loads on different dates
 - [ ] **T-3.11** Check the bill after a day — Redshift Serverless is the first component that can cost real money, and the usage limit is the only guard (T-6.3)
 - [ ] **T-3.12** Decide whether the ETL and the load should be chained by Step Functions now that there is a second step (D-17 said to revisit at exactly this point)
 
-## Phase 4 — Training *(to expand)*
+## Phase 4 — Training
 
-- [ ] **T-4.1** Artifacts bucket and the versioned training-set layout
-- [ ] **T-4.2** UNLOAD via the Redshift Data API (D-26)
-- [ ] **T-4.3** SageMaker execution role
-- [ ] **T-4.4** Training job in script mode (D-28)
-- [ ] **T-4.5** Model Registry, with manual approval
-- [ ] **T-4.6** Decide where feature engineering lives — **settle before writing transform code** (D-27)
+- [x] **T-4.1** Versioned training-set layout: `s3://<artifacts>/training/<version>/`, so a model version maps to the exact rows it learned from
+- [x] **T-4.2** `UNLOAD` via the Redshift Data API — training needs no VPC attachment (D-26)
+- [x] **T-4.3** SageMaker execution role: training inputs and model artifacts only, ECR layer pulls scoped to the managed image's repository
+- [x] **T-4.4** `ml/train.py` in script mode on the managed scikit-learn container (D-28)
+- [x] **T-4.5** Model Package Group; `scripts/train_model.sh` registers versions as `PendingManualApproval` (D-31)
+- [x] **T-4.6** Feature engineering split settled: warehouse selects rows and labels, the sklearn `Pipeline` owns encoding and scaling (D-27, Q-02)
+- [ ] **T-4.7** Apply phase 4 and confirm the role and model package group exist
+- [ ] **T-4.8** Verify `sagemaker_training_image` is right for the region before the first run — a wrong URI fails `create-training-job` immediately
+- [ ] **T-4.9** ⚠️ **Blocked on T-3.8** — run `scripts/train_model.sh` end to end. It UNLOADs from `ml.orders_training`, which is empty until the warehouse is loaded
+- [ ] **T-4.10** Confirm the registered version is `PendingManualApproval` and that nothing deployed on its own
+- [ ] **T-4.11** Re-check the leakage exclusions against a real UNLOAD, not just the view definition
+- [ ] **T-4.12** Decide whether `order_dow` earns its place — it is the only time-derived feature left, and the ETL's four timestamp formats make time features risky (see T-2.16)
 
 ## Phase 5 — Inference *(to expand)*
 

@@ -932,3 +932,76 @@ variable because it is the first suspect if a load fails with an opaque S3 or KM
 timeout. And the usage limit deactivates the workgroup on breach, which is
 protective but will present as an outage. T-3.12 was added because D-17 said to
 revisit Step Functions once a second pipeline step existed; the load is that step.
+
+---
+
+### 015 — Phase 4: training, and the feature-engineering split
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `ml/train.py` (new), `sql/migrations/005_ml_training_view.sql` (new), `sql/unload_training_set.sql` (new), `scripts/train_model.sh` (new), `tests/test_train.py` (new), `envs/dev/sagemaker.tf` (new), `envs/dev/{variables,outputs}.tf`, `requirements-dev.txt`, `README.md`, `CLAUDE.md`, `PROJECT_SCOPE.md`, `TODO.md`
+
+**Prompt**
+
+```text
+lets proceed to phase 4
+```
+
+**Output**
+
+Asked one question first — Q-02, the ML target — because it is the open question
+the scope flags as blocking D-27 and D-28, and it determines what the training
+script contains. Offered three options grounded in what the data actually
+supports. **Answer: refund risk, binary classification.**
+
+**T-4.6 / D-27, the decision that matters.** The split runs along one line: row
+selection and labelling in the warehouse, row-local transforms in the model
+artifact. `ml.orders_training` is SQL — reviewable in a diff — and the artifact
+is a single sklearn `Pipeline` containing imputation, encoding, scaling and the
+classifier, so inference physically cannot preprocess differently from training.
+
+Three leakage exclusions are documented in the view rather than left implicit:
+`shipping_days` is unknown at scoring time; `pending` orders are excluded because
+they have not resolved, and at scoring time every new order is pending; and the
+**hour** of `order_ts` is excluded because 7 of 19 source rows carry a date with
+no time — hour would encode which timestamp format a row arrived in, a property
+of our ETL rather than of the order.
+
+Built: the training view, `UNLOAD` to a versioned prefix via the Data API (so
+training needs no VPC attachment, and the unloaded files *are* the reproducible
+artifact), a SageMaker execution role, a Model Package Group, `ml/train.py`, and
+`scripts/train_model.sh` — unload, package, train, register as
+`PendingManualApproval`. A retrain is a script, never a `terraform apply`.
+
+**Verification run — the training path was actually executed, on real data.**
+Installed scikit-learn/pandas, then built a training set locally by running the
+**real** Spark transform over `data/dpe_interview_takehome_data.csv` and applying
+the same SELECT as the view: 15 rows (19 minus 4 pending), 6 refunded. Trained on
+it: cross-validated ROC AUC **0.537**, which the script itself reports alongside a
+warning that the dataset is far too small for the number to mean anything.
+Reloaded the artifact and confirmed it carries its preprocessing and returns a
+probability for a row with an unseen region, channel and category rather than
+raising — a 500 on an unseen value is the obvious way an endpoint like this
+fails.
+
+**19 tests** added, including a guard that the view's SELECT list and the
+script's feature list agree; verified it fires by introducing drift and watching
+the suite fail. Also asserted the leakage exclusions and that the view reads
+`analytics.orders` rather than `landing.orders` — training on the history table
+would see each order once per ETL run.
+
+Checkov flagged `CKV_AWS_356` on the SageMaker policy. Fixed properly rather than
+suppressed: only `ecr:GetAuthorizationToken` genuinely has no resource form, so
+it was split out and the three layer-pull actions scoped to the managed image's
+repository ARN, derived from the configured image URI.
+
+**Verification:** 119 tests pass; all five pre-commit hooks pass.
+
+**Notes**
+
+Accepted as-is, unapplied. `sagemaker_training_image` is a region-specific guess
+and needs checking before the first run (T-4.8) — a wrong URI fails
+`create-training-job` immediately, so it is cheap to be wrong. The dependency
+chain is now four deep: T-4.9 waits on T-3.8, which waits on T-2.12, which waits
+on an apply. Nothing downstream of the Glue job has run against AWS.

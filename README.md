@@ -280,6 +280,42 @@ aws redshift-data execute-statement \
 > surprise bill. If queries start failing for no clear reason, check the usage
 > limit before assuming an outage.
 
+### Training a model
+
+Terraform owns the execution role and the registry; producing a model version is
+a script, so a retrain never needs an apply (D-31):
+
+```bash
+scripts/train_model.sh          # version = current UTC timestamp
+```
+
+It unloads `ml.orders_training` to `s3://<artifacts>/training/<version>/`,
+packages `ml/train.py`, runs a SageMaker training job, and registers the result
+as **PendingManualApproval**. Nothing deploys until someone approves it:
+
+```bash
+aws sagemaker update-model-package --model-package-arn <arn> \
+  --model-approval-status Approved
+```
+
+The model predicts **whether an order will end up refunded**, from information
+available when the order is placed. What it learns from — and, more importantly,
+what it must not see — is defined in
+[`sql/migrations/005_ml_training_view.sql`](./sql/migrations/005_ml_training_view.sql).
+
+The artifact is a single sklearn `Pipeline` with preprocessing inside it, so
+training and inference share one code path (D-27).
+
+`ml/train.py` runs unchanged on a laptop, which is how it is tested:
+
+```bash
+venv/bin/python ml/train.py --train <dir-of-csv> --model-dir <out>
+```
+
+> On the sample data this trains on 15 rows and scores an ROC AUC around 0.54 —
+> indistinguishable from guessing, and correctly so. The training script says as
+> much in its own output. The deliverable here is the pipeline, not the model.
+
 ### Discovering a schema
 
 The raw crawler is on-demand and exists only to answer "what is actually in this
@@ -335,7 +371,8 @@ venv/bin/python -m pip install -r requirements-dev.txt
 ├── tests/                  # pytest: helpers, spec invariants, Spark transform
 ├── data/                   # sample source data
 ├── scripts/                # land_sample_data.sh, redshift_sql.sh
-├── sql/                    # Redshift DDL migrations + the partition load
+├── sql/                    # Redshift DDL migrations, partition load, UNLOAD
+├── ml/                     # train.py — runs locally and in SageMaker unchanged
 ├── envs/
 │   └── dev/                # dev environment root module
 │       ├── backend.tf      # remote state; remove this file to go local
