@@ -171,7 +171,31 @@ gymnastics.
 The partition key for the processed zone should be whatever the ETL and Redshift
 loads actually filter on — event date, not ingest date, if those differ.
 
-**Decided (2026-08-26):** `<source>/<dataset>/ingest_date=YYYY-MM-DD/` for both raw and processed, documented in [docs/data-layout.md](./docs/data-layout.md). Whether the processed zone should additionally (or instead) partition on *event* date stays open until the schema is known — Q-01, Q-02.
+**Revised (2026-08-27): the zones are asymmetric.**
+
+```
+raw        <source>/<dataset>/<file>
+processed  <source>/<dataset>/ingest_date=YYYY-MM-DD/*.parquet
+```
+
+Raw is flat. It holds one small, whole dataset that arrives as a single file, and
+partitioning it by arrival date added a path segment that carried no information
+— every partition would have held the same file. A run now reads the entire
+dataset prefix.
+
+Processed keeps `ingest_date`, which is the date of the **run**. Each partition
+is therefore a complete snapshot of raw at that moment, which has one consequence
+worth stating plainly: **consumers must read the newest partition, not all of
+them**, or every row is counted once per run. Rerunning a date still purges and
+rewrites that partition, so idempotency is unaffected.
+
+Two things this leaves open. If a real feed later delivers dated drops, raw
+should be partitioned again (Q-01). And once the data is queried in anger,
+partitioning processed on `order_date` — already derived — would suit real
+queries better and make partitions additive rather than repeated; worth settling
+before the phase 3 COPY, since it changes what Redshift should read.
+
+Documented in [docs/data-layout.md](./docs/data-layout.md).
 
 **D-13 — Encryption.** SSE-S3 (free, AWS-managed) or SSE-KMS with a
 customer-managed key (auditable, grantable, ~$1/month/key plus request charges)?
@@ -462,3 +486,4 @@ state.
 | 2026-08-26 | `pre-commit` added (fmt, validate, tflint, checkov). Two real findings fixed — Glue security configuration and a CMK on the ETL schedule. Two documented skips: one verified false positive, one deferred to T-6.6. |
 | 2026-08-26 | Real dataset arrived. `takehome/orders` schema and cleaning rules declared in the job; `inferSchema` demoted to a fallback. D-20 extended: row-level failures are quarantined to `_rejected/` with a reason and a reject-rate threshold, rather than failing the batch. Q-01 partially answered. |
 | 2026-08-26 | pytest suite added (96 tests). It caught two implicit runtime dependencies in the job: ANSI mode (a failed cast throws rather than nulling, which would abort a batch and defeat quarantine entirely) and session timezone (date bucketing able to shift a day). Both are now set explicitly in `configure_session()`. |
+| 2026-08-27 | D-12 revised: raw is flat (`<source>/<dataset>/<file>`), processed stays partitioned by `ingest_date` = the run date. Processed partitions are now full snapshots, so consumers read the newest one. `--ingest_date` defaults to `today`; `latest` now resolves against processed, to redo the most recent load. |

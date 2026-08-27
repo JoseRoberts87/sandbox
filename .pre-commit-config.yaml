@@ -15,7 +15,10 @@ repos:
     hooks:
       - id: pytest
         name: pytest (non-Spark)
-        entry: pytest
+        # Must be the venv interpreter: the job module imports pyspark at import
+        # time, so even the non-Spark tests need it. A bare `pytest` resolves to
+        # whatever is first on PATH, which will not have it.
+        entry: venv/bin/python -m pytest
         language: system
         pass_filenames: false
         types: [python]

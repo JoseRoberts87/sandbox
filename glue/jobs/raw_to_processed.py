@@ -1,14 +1,22 @@
-"""Glue ETL: one raw ingest_date partition -> partitioned Parquet in processed.
+"""Glue ETL: the raw dataset -> a partitioned Parquet snapshot in processed.
 
-Layout on both sides (docs/data-layout.md, D-12):
+Layout (docs/data-layout.md, D-12):
 
-    s3://<raw>/<source>/<dataset>/ingest_date=YYYY-MM-DD/<file>
+    s3://<raw>/<source>/<dataset>/<file>
     s3://<processed>/<source>/<dataset>/ingest_date=YYYY-MM-DD/*.parquet
 
-A run is addressed by a single date, so a rerun of a date replaces that
-partition instead of appending to it (D-19). Backfilling is the same code path
-with a different --ingest_date, which is why job bookmarks are disabled: all
-progress state is visible in S3 rather than hidden in the Glue service.
+Raw is flat: a run reads every file under the dataset prefix. Processed is
+partitioned by ingest_date, which is the date of the *run*, not a property of
+the data.
+
+That makes each processed partition a complete snapshot of raw as of that run,
+so **consumers should read the newest ingest_date partition, not all of them** —
+summing across partitions counts the same orders once per run.
+
+Rerunning the same date is safe: the job purges that partition before rewriting
+it (D-19), so a rerun replaces rather than appends. Job bookmarks are disabled,
+which keeps all progress state visible in S3 rather than hidden in the Glue
+service.
 
 Datasets are declared in DATASET_SPECS below, keyed by "<source>/<dataset>".
 A spec gives the column list, target types, cleaning rule per column, and the
@@ -36,7 +44,10 @@ run with `aws glue start-job-run --arguments`):
     --source_name         first path segment, e.g. the system data came from
     --dataset             second path segment
     --source_format       csv | json | parquet          (default csv)
-    --ingest_date         YYYY-MM-DD | latest | yesterday | today  (default latest)
+    --ingest_date         the partition this run writes:
+                          YYYY-MM-DD | today | yesterday | latest  (default today)
+                          `latest` reuses the newest partition already in
+                          processed, i.e. redo the most recent load in place
     --max_reject_pct      fail the run above this percentage (default 5.0)
     --update_catalog      true | false                  (default true)
     --allow_empty         true | false                  (default false)
@@ -144,10 +155,15 @@ REQUIRED_ARGS = [
     "dataset",
 ]
 
+# Reserved by Glue: awsglue.getResolvedOptions registers these itself whenever
+# they appear in argv, and only special-cases JOB_NAME. Asking it to resolve
+# JOB_ID or JOB_RUN_ID re-adds an argument argparse already has, which fails the
+# run before it starts with "conflicting option string". Read them from argv.
+RESERVED_ARGS = ("JOB_ID", "JOB_RUN_ID")
+
 OPTIONAL_ARGS = {
-    "JOB_RUN_ID": "unknown",
     "source_format": "csv",
-    "ingest_date": "latest",
+    "ingest_date": "today",
     "required_columns": "",
     "max_reject_pct": "5.0",
     "update_catalog": "true",
@@ -171,6 +187,17 @@ def fail(message):
     raise SystemExit(f"[raw_to_processed] FAILED: {message}")
 
 
+def argv_value(name, default=None):
+    """Read `--name value` straight from argv, for arguments getResolvedOptions
+    refuses to resolve."""
+    flag = f"--{name}"
+    if flag in sys.argv:
+        index = sys.argv.index(flag) + 1
+        if index < len(sys.argv) and not sys.argv[index].startswith("--"):
+            return sys.argv[index]
+    return default
+
+
 def resolve_args():
     args = getResolvedOptions(sys.argv, REQUIRED_ARGS)
 
@@ -182,6 +209,12 @@ def resolve_args():
         if not args.get(name):
             args[name] = default
 
+    # Glue may already have surfaced these; fall back to argv, then to a marker
+    # so lineage columns are never null.
+    for name in RESERVED_ARGS:
+        if not args.get(name):
+            args[name] = argv_value(name, "unknown")
+
     return args
 
 
@@ -190,7 +223,11 @@ def as_bool(value):
 
 
 def latest_partition(bucket, prefix):
-    """Newest ingest_date=* partition present under a dataset prefix."""
+    """Newest ingest_date=* partition present under a dataset prefix.
+
+    Raw is unpartitioned, so this is asked of the processed zone: it answers
+    "which partition did the last run write", for redoing that load in place.
+    """
     paginator = boto3.client("s3").get_paginator("list_objects_v2")
     dates = []
 
@@ -209,6 +246,8 @@ def latest_partition(bucket, prefix):
 
 
 def resolve_ingest_date(value, bucket, prefix):
+    """Resolve the partition this run writes. `bucket` is the processed bucket,
+    consulted only for `latest`."""
     value = str(value).strip().lower()
     today = datetime.now(timezone.utc).date()
 
@@ -473,9 +512,9 @@ def main():
     dataset_prefix = f"{source_name}/{dataset}/"
     spec = DATASET_SPECS.get(f"{source_name}/{dataset}")
 
-    ingest_date = resolve_ingest_date(args["ingest_date"], args["raw_bucket"], dataset_prefix)
+    ingest_date = resolve_ingest_date(args["ingest_date"], args["processed_bucket"], dataset_prefix)
 
-    input_path = f"s3://{args['raw_bucket']}/{dataset_prefix}ingest_date={ingest_date}/"
+    input_path = f"s3://{args['raw_bucket']}/{dataset_prefix}"
     dataset_root = f"s3://{args['processed_bucket']}/{dataset_prefix}"
     output_partition = f"{dataset_root}ingest_date={ingest_date}/"
     rejected_root = f"s3://{args['processed_bucket']}/{REJECTED_ROOT}/{dataset_prefix}"

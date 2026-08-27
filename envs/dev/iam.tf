@@ -137,6 +137,15 @@ data "aws_iam_policy_document" "glue_job" {
     resources = local.glue_catalog_arns
   }
 
+  # The job has a security configuration attached and must be able to read it.
+  # Not resource-scopeable: Glue requires "*" for this action.
+  statement {
+    sid       = "ReadGlueSecurityConfiguration"
+    effect    = "Allow"
+    actions   = ["glue:GetSecurityConfiguration"]
+    resources = ["*"]
+  }
+
   statement {
     sid       = "Logs"
     effect    = "Allow"

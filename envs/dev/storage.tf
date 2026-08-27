@@ -72,3 +72,14 @@ module "artifacts" {
     DataZone  = "artifacts"
   }
 }
+
+resource "aws_s3_object" "raw_dataset_prefix" {
+  bucket                 = module.raw.id
+  key                    = "${var.etl_source_name}/${var.etl_dataset}/"
+  content                = ""
+  server_side_encryption = "aws:kms"
+  kms_key_id             = aws_kms_key.s3.arn
+  depends_on = [
+    module.raw
+  ]
+}
