@@ -123,8 +123,9 @@ resource "aws_lambda_function" "predict" {
 
   environment {
     variables = {
-      ENDPOINT_NAME = aws_sagemaker_endpoint.refund_risk[0].name
-      MAX_INSTANCES = tostring(var.predict_max_instances)
+      ENDPOINT_NAME   = aws_sagemaker_endpoint.refund_risk[0].name
+      MAX_INSTANCES   = tostring(var.predict_max_instances)
+      REQUIRED_FIELDS = join(",", var.predict_required_fields)
     }
   }
 
@@ -242,6 +243,84 @@ resource "aws_api_gateway_deployment" "predict" {
   }
 }
 
+# ------------------------ account-level logging role --------------------------
+# API Gateway refuses to attach a log destination to a stage unless the account
+# has a CloudWatch Logs role configured: "CloudWatch Logs role ARN must be set
+# in account settings to enable logging".
+#
+# **This is an account-wide, region-wide setting.** It is not scoped to this
+# project, and Terraform destroying it would disable logging for every API
+# Gateway API in the account. Acceptable here because the account is dedicated
+# to this project; it would not be in a shared one (D-30, T-5.15).
+
+data "aws_iam_policy_document" "api_gateway_logs_assume_role" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["apigateway.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "api_gateway_logs" {
+  count = local.inference_enabled ? 1 : 0
+
+  name               = "${local.name_prefix}-apigateway-logs"
+  description        = "Account-level role letting API Gateway write to CloudWatch Logs."
+  assume_role_policy = data.aws_iam_policy_document.api_gateway_logs_assume_role.json
+
+  tags = {
+    Name      = "${local.name_prefix}-apigateway-logs"
+    Component = "ml"
+  }
+}
+
+# Written out rather than using AmazonAPIGatewayPushToCloudWatchLogs, matching
+# how IAM is handled everywhere else here: the managed policy grants these
+# actions on "*", and all but one of them can be scoped.
+data "aws_iam_policy_document" "api_gateway_logs" {
+  statement {
+    sid    = "WriteLogs"
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:DescribeLogStreams",
+      "logs:PutLogEvents",
+      "logs:GetLogEvents",
+      "logs:FilterLogEvents",
+    ]
+    resources = ["arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:*"]
+  }
+
+  # DescribeLogGroups has no resource-level form in IAM.
+  statement {
+    sid       = "DescribeLogGroups"
+    effect    = "Allow"
+    actions   = ["logs:DescribeLogGroups"]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "api_gateway_logs" {
+  count = local.inference_enabled ? 1 : 0
+
+  name   = "${local.name_prefix}-apigateway-logs"
+  role   = aws_iam_role.api_gateway_logs[0].id
+  policy = data.aws_iam_policy_document.api_gateway_logs.json
+}
+
+resource "aws_api_gateway_account" "main" {
+  count = local.inference_enabled ? 1 : 0
+
+  cloudwatch_role_arn = aws_iam_role.api_gateway_logs[0].arn
+
+  depends_on = [aws_iam_role_policy.api_gateway_logs]
+}
+
 resource "aws_cloudwatch_log_group" "api_access" {
   # checkov:skip=CKV_AWS_338:Retention is a deliberate choice, not an oversight
   # — `log_retention_days`, 30 by default. A year of dev logs is cost without a
@@ -269,6 +348,10 @@ resource "aws_api_gateway_stage" "predict" {
   rest_api_id   = aws_api_gateway_rest_api.predict[0].id
   deployment_id = aws_api_gateway_deployment.predict[0].id
   stage_name    = var.environment
+
+  # Without this the stage is created before the account-level logging role and
+  # fails with "CloudWatch Logs role ARN must be set in account settings".
+  depends_on = [aws_api_gateway_account.main]
 
   xray_tracing_enabled = true
 

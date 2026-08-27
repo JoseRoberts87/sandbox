@@ -147,3 +147,13 @@ output "deployed_model_package_arn" {
   description = "Model Registry version currently being served."
   value       = var.approved_model_package_arn != "" ? var.approved_model_package_arn : null
 }
+
+output "etl_source_name" {
+  description = "Source segment of the dataset prefix. Scripts read this so the path is defined in one place."
+  value       = var.etl_source_name
+}
+
+output "etl_dataset" {
+  description = "Dataset segment of the dataset prefix."
+  value       = var.etl_dataset
+}

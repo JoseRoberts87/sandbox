@@ -18,6 +18,12 @@ ROOT = Path(__file__).resolve().parents[1]
 ENDPOINT = "sandbox-dev-refund-risk"
 
 
+ORDER = {
+    "region": "EMEA", "channel": "retail", "category": "puzzles",
+    "quantity": 2, "unit_price_usd": 30.0, "discount_pct": 0.0, "order_dow": 3,
+}
+
+
 class FakeClientError(Exception):
     """Stands in for botocore.exceptions.ClientError."""
 
@@ -59,6 +65,7 @@ def proxy(monkeypatch):
     monkeypatch.setitem(sys.modules, "botocore.exceptions", exceptions_stub)
     monkeypatch.setenv("ENDPOINT_NAME", ENDPOINT)
     monkeypatch.setenv("MAX_INSTANCES", "3")
+    monkeypatch.setenv("REQUIRED_FIELDS", ",".join(ORDER))
 
     spec = importlib.util.spec_from_file_location(
         "predict_handler", ROOT / "lambda" / "predict" / "handler.py"
@@ -66,12 +73,6 @@ def proxy(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module, runtime
-
-
-ORDER = {
-    "region": "EMEA", "channel": "retail", "category": "puzzles",
-    "quantity": 2, "unit_price_usd": 30.0, "discount_pct": 0.0, "order_dow": 3,
-}
 
 
 def call(proxy, body, **event):
@@ -131,6 +132,22 @@ class TestBadRequests:
         # The endpoint must not be woken for a request that cannot be valid.
         assert runtime.last_call is None
 
+    def test_missing_required_field_is_caught_before_the_model(self, proxy):
+        """Regression: this used to reach the endpoint, which returned an HTML
+        500 that SageMaker wrapped in a message containing the AWS account id
+        and a CloudWatch console URL — all of it returned to the caller."""
+        incomplete = {k: v for k, v in ORDER.items() if k != "discount_pct"}
+        response, parsed, runtime = call(proxy, {"instances": [incomplete]})
+
+        assert response["statusCode"] == 400
+        assert "discount_pct" in parsed["error"]
+        assert runtime.last_call is None, "the endpoint must not be woken for this"
+
+    def test_missing_field_names_the_offending_instance(self, proxy):
+        response, parsed, _ = call(proxy, {"instances": [ORDER, {"region": "EMEA"}]})
+        assert response["statusCode"] == 400
+        assert "instance 1" in parsed["error"]
+
     def test_oversized_batch_is_rejected(self, proxy):
         response, parsed, runtime = call(proxy, {"instances": [ORDER] * 4})
         assert response["statusCode"] == 400
@@ -139,13 +156,24 @@ class TestBadRequests:
 
 
 class TestEndpointFailures:
-    def test_model_error_becomes_400_and_keeps_the_reason(self, proxy):
+    def test_model_error_becomes_400_without_echoing_the_model(self, proxy):
+        """SageMaker wraps the container's response, and that wrapper carries the
+        account id, the endpoint name and a console URL. None of it may reach an
+        external caller — the predictable case is already handled at the edge."""
         module, runtime = proxy
-        runtime.raise_error = FakeClientError("ModelError", "missing required fields: ['region']")
+        runtime.raise_error = FakeClientError(
+            "ModelError",
+            'Received server error (500) from model with message "<!DOCTYPE HTML>...". '
+            "See https://us-east-1.console.aws.amazon.com/cloudwatch/home"
+            "#logEventViewer:group=/aws/sagemaker/Endpoints/sandbox-dev-refund-risk "
+            "in account 823878989845 for more information.",
+        )
         response, parsed, _ = call(proxy, {"instances": [ORDER]})
+
         assert response["statusCode"] == 400
-        # The caller can act on this one, so it is worth passing back.
-        assert "region" in parsed["error"]
+        body = response["body"]
+        for leak in ("823878989845", "console.aws.amazon.com", "DOCTYPE", "sandbox-dev-refund-risk"):
+            assert leak not in body, f"leaked {leak!r} to the caller"
 
     @pytest.mark.parametrize(
         "code", ["ServiceUnavailable", "ThrottlingException", "ModelNotReadyException"]

@@ -20,26 +20,28 @@ its turn comes, not before.
 
 ## Now — the next three things
 
-Infrastructure through phase 5 is applied. The data path runs as far as the
-warehouse. What has never run is everything from training onward.
+**The pipeline works end to end**: raw CSV → Glue → Parquet → Redshift →
+training → registry → approved model → serverless endpoint → public API,
+verified by `make smoke`. What remains is verification, cost control, and the
+decisions deferred along the way.
 
-1. **T-3.7** — `scripts/redshift_sql.sh sql/migrations`. The schemas do not
-   exist, so the warehouse is empty and everything downstream is blocked.
-2. **T-3.8 → T-3.10** — load a snapshot, then verify the two properties the
-   design rests on: a repeated load must not double rows, and
-   `analytics.orders` must return only the newest snapshot.
-3. **T-4.8 → T-5.8** — training image check, train, approve, set
-   `approved_model_package_arn`, apply, smoke test.
+1. **T-3.13 / T-3.9 / T-3.10** — `make verify`, then prove the two warehouse
+   properties the design rests on: a repeated load must not double rows, and
+   `analytics.orders` must return only the newest snapshot. Both need a second
+   load to test at all.
+2. **T-6.3 / T-1.9 / T-3.11** — everything is now deployed and idling with **no
+   budget alarm**. The Redshift usage limit is the only automatic guard, and it
+   covers Redshift alone.
+3. **T-2.10 / T-2.16** — close out the two pieces of deliberate temporary state:
+   the sink-managed catalog table, and the two unconfirmed dataset assumptions
+   (month-first dates, the `net_amount_usd` definition).
 
 ## Blocked
 
 | Task | Waiting on |
 |---|---|
-| T-3.8, T-3.9, T-3.10 | **T-3.7** — no schemas, so nothing can be loaded or queried |
-| T-4.9 | **T-3.8** — training UNLOADs from `ml.orders_training`, which needs a loaded warehouse |
-| T-4.10, T-4.11 | **T-4.9** — nothing to inspect until a training run has produced a version |
-| T-5.8, T-5.10 | **T-4.9** — there is no model version to approve |
-| T-2.17 | A stable processed schema (T-2.10) for a rule set to target |
+| T-3.9, T-3.10 | A second load — snapshot filtering cannot be observed with one |
+| T-2.17 | A declared processed table (T-2.10) for a rule set to target |
 | T-1.9, T-3.11 | A few days of billing history |
 
 ---
@@ -68,7 +70,7 @@ warehouse. What has never run is everything from training onward.
 - [x] **T-1.7** Prefix layout settled as `<source>/<dataset>/ingest_date=YYYY-MM-DD/` and documented in [docs/data-layout.md](./docs/data-layout.md) (D-12)
 - [x] **T-1.8** Processed and artifacts buckets created now, alongside the ETL that writes to them (D-11)
 - [ ] **T-1.9** Check the bill after a few days — confirm an idle environment costs roughly the KMS key and nothing else
-- [ ] **T-1.10** Land `data/dpe_interview_takehome_data.csv` in raw at `takehome/orders/` — run `scripts/land_sample_data.sh`
+- [x] **T-1.10** Sample data landed via `scripts/land_sample_data.sh`
 
 ## Phase 2 — ETL
 
@@ -100,10 +102,11 @@ warehouse. What has never run is everything from training onward.
 - [x] **T-3.4** `landing` / `analytics` / `ml` schemas as ordered SQL migrations, applied via the Data API — Terraform owns infrastructure, not schema (D-24, D-38)
 - [x] **T-3.5** Load path: Spectrum external schema + delete-then-insert per partition, idempotent (D-23, revised from COPY)
 - [x] **T-3.6** Apply phase 3, and confirm the workgroup reaches `AVAILABLE`
-- [ ] **T-3.7** Run `scripts/redshift_sql.sh sql/migrations` and confirm all **five** files apply. **Reopened 2026-08-27:** `analytics` schema does not exist, so this never applied. Terraform apply does not run migrations — they are a separate deliberate step (D-38)
-- [ ] **T-3.8** Load a snapshot end to end. **Reopened 2026-08-27:** `sql/load_orders.sql` targets `landing.orders`, which cannot exist while the schemas do not — so this could not have succeeded either. Blocked on T-3.7
+- [x] **T-3.7** All five migrations applied
+- [x] **T-3.8** Snapshot loaded. Confirmed indirectly but conclusively: the endpoint serves a model trained from `ml.orders_training`, which reads through `analytics.orders` to `landing.orders` — training would have failed on an empty warehouse
 - [ ] **T-3.9** Verify idempotency: run the load twice for one date, confirm the row count does not double
 - [ ] **T-3.10** Confirm `analytics.orders` returns only the newest snapshot after two loads on different dates
+- [ ] **T-3.14** Decide whether to restore `enhanced_vpc_routing`. Doing it properly needs interface endpoints for the Glue catalog (and probably STS/KMS) plus wider SG egress — roughly $7/month per endpoint per AZ, so ~$60/month across three AZs in an environment designed to idle near zero. Turned **off** 2026-08-27 to unblock the load; the trade is that Redshift's S3 traffic uses the managed network rather than our VPC
 - [ ] **T-3.13** Confirm `terraform plan` reports no changes — proves what is deployed matches the committed configuration, and that no console edits have crept in
 - [ ] **T-3.11** Check the bill after a day — Redshift Serverless is the first component that can cost real money, and the usage limit is the only guard (T-6.3)
 - [ ] **T-3.12** Decide whether the ETL and the load should be chained by Step Functions now that there is a second step (D-17 said to revisit at exactly this point)
@@ -118,8 +121,8 @@ warehouse. What has never run is everything from training onward.
 - [x] **T-4.6** Feature engineering split settled: warehouse selects rows and labels, the sklearn `Pipeline` owns encoding and scaling (D-27, Q-02)
 - [x] **T-4.7** Phase 4 applied — SageMaker execution role and model package group exist
 - [ ] **T-4.8** Verify `sagemaker_training_image` is right for the region before the first run — a wrong URI fails `create-training-job` immediately
-- [ ] **T-4.9** ⚠️ **Blocked on T-3.8** — run `scripts/train_model.sh` end to end. It UNLOADs from `ml.orders_training`, which is empty until the warehouse is loaded
-- [ ] **T-4.10** Confirm the registered version is `PendingManualApproval` and that nothing deployed on its own
+- [x] **T-4.9** Training ran end to end and registered a version
+- [x] **T-4.10** Version registered as `PendingManualApproval`; the endpoint appeared only after the ARN was set and applied
 - [ ] **T-4.11** Re-check the leakage exclusions against a real UNLOAD, not just the view definition
 - [ ] **T-4.12** Decide whether `order_dow` earns its place — it is the only time-derived feature left, and the ETL's four timestamp formats make time features risky (see T-2.16)
 
@@ -132,8 +135,13 @@ warehouse. What has never run is everything from training onward.
 - [x] **T-5.6** `ml/inference.py` returning `predict_proba`; the container's default handler returns a class label, which is useless as a risk score
 - [x] **T-5.7** `scripts/smoke_test_endpoint.sh` — exercises the public path exactly as an external consumer would
 - [x] **T-5.12** Phase 5 applied — logs KMS key created; the rest of the stack stays gated until a model is approved
-- [ ] **T-5.8** ⚠️ **Blocked on T-4.9** — approve a version, set `approved_model_package_arn`, apply, and run the smoke test (T-5.5)
+- [x] **T-5.8 / T-5.5** Endpoint deployed and the public API verified end to end — valid, batch, unseen values, three malformed payloads, and a request with no API key
+- [x] **T-5.16** Fixed an information leak: a missing field reached the model, which returned an HTML 500 that SageMaker wrapped in a message carrying the AWS account id and a CloudWatch console URL, returned to an unauthenticated caller. The proxy now validates required fields at the edge and never echoes `ModelError` text; the smoke test asserts response bodies, not just status codes
+- [ ] ~~**T-5.8** Blocked on T-4.9~~
 - [ ] **T-5.11** Confirm the gate works in the negative: with `approved_model_package_arn` empty, `inference_enabled` is false and no endpoint, Lambda, API or log group exists
+- [ ] **T-5.15** ⚠️ `aws_api_gateway_account` is an **account-wide, region-wide** setting this stack now owns. Destroying it disables CloudWatch logging for every API Gateway API in the account, and a second stack setting it would fight this one. Fine in a dedicated account; move it to a separate bootstrap configuration before sharing the account
+- [ ] **T-5.14** After the endpoint is up, confirm a promotion actually rolls it: approve a second version, apply, and check the model is replaced create-before-destroy with no collision and no downtime (this is what T-5.10 exercises, now that the name scheme supports it)
+- [ ] **T-5.13** If D-29 is ever revised to a provisioned endpoint, re-enable `endpoint_network_isolation` and set `kms_key_arn` on the endpoint configuration — both are supported there and both are currently documented checkov skips
 - [ ] **T-5.9** Decouple the front door from the model gate before prod: today, clearing `approved_model_package_arn` destroys the API key and URL along with the endpoint. Fine with no consumers; not fine once a key has been issued
 - [ ] **T-5.10** Verify a promotion rolls the endpoint in place — approve a second version, apply, confirm the endpoint updates and keeps serving
 
@@ -159,6 +167,11 @@ warehouse. What has never run is everything from training onward.
 - [x] **T-X.4** `pre-commit` runs `terraform_fmt`, `terraform_validate`, `terraform_tflint` and `terraform_checkov` — all passing
 - [x] **T-X.5** `pytest` suite: 96 tests over helpers, dataset-spec invariants and the Spark transform, including the real sample file end to end
 - [x] **T-X.6** pre-commit hook runs `pytest -m "not spark"` via the venv interpreter
+- [x] **T-X.14** `redshift_sql.sh` and `redshift_query.sh` wait for the workgroup to be `AVAILABLE`. A `MODIFYING` workgroup returned `Redshift endpoint is not available`, which gives no hint that waiting is the answer
+- [x] **T-X.13** Fixed a `set -e` bug class in the scripts: `aws s3 ls` and `grep` exit 1 when they find nothing, which aborted `run_etl.sh` on a *successful* run and made the guidance messages in `load_warehouse.sh` and `promote_model.sh` unreachable. `tests/test_scripts.py` guards against it
+- [x] **T-X.12** README covers clone → deployed → tested from nothing: per-platform toolchain install (including `make` itself), `scripts/preflight.sh`, and a target-to-command table for developers without `make`
+- [x] **T-X.10** `Makefile` — every stage as its own target plus composites; `make help` lists them. `apply` is never auto-approved, and promotion stays a manual tfvars edit (D-07, D-31)
+- [x] **T-X.11** `scripts/run_etl.sh`, `scripts/load_warehouse.sh`, `scripts/verify.sh` — the manual steps scripted, and the entry-017 checklist made executable
 - [x] **T-X.9** `scripts/redshift_sql.sh` no longer reports success on an empty file list — it exited 0 having applied nothing, which is how T-3.7 could look done
 - [x] **T-X.8** `scripts/redshift_query.sh` — run a SELECT and read the rows back, for verification work
 - [ ] **T-X.7** Run the suite against pyspark 3.5 as well, to match the Spark version Glue 5.0 actually runs

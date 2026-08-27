@@ -1186,3 +1186,618 @@ Accepted as-is. The tracker had two tasks marked done that demonstrably were
 not, which is worth noting as a process point: checking a box at apply time is
 not the same as verifying the thing. The validation checklist in entry 017 is
 what caught it, on its first real use.
+
+---
+
+### 019 — Makefile and a linear README
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `Makefile` (new), `scripts/{run_etl,load_warehouse,verify}.sh` (new), `scripts/land_sample_data.sh`, `envs/dev/outputs.tf`, `README.md`, `CLAUDE.md`, `PROJECT_SCOPE.md`, `TODO.md`
+
+**Prompt**
+
+```text
+lets update the readme with all of the steps required to install and run the entire thing. make sure to include all of the manual steps and also include a Make file that automates the deployment and the manual steps and also include separate make commands to just run a part of the process
+```
+
+**Output**
+
+Three gaps had to be filled before a Makefile would be honest rather than a
+wrapper around inline shell:
+
+- **`scripts/run_etl.sh`** — Glue has no waiter for job runs, so the README had
+  been telling people to poll by hand. It starts the job, polls to a terminal
+  state, prints the resulting partitions, and warns if anything was quarantined.
+- **`scripts/load_warehouse.sh`** — the load needs an `ingest_date`, which had
+  to be looked up in S3 first. It defaults to the newest partition actually
+  present rather than assuming today, since the ETL may have last run on a
+  different day.
+- **`scripts/verify.sh`** — makes the entry-017 checklist executable. Every
+  check runs even after one fails, because knowing which three things are broken
+  beats knowing the first.
+
+Also added `etl_source_name` / `etl_dataset` outputs and pointed
+`land_sample_data.sh` at them, so the dataset prefix is defined once in
+`terraform.tfvars` instead of hardcoded per script.
+
+**The Makefile** has a target per stage (`land`, `etl`, `migrate`, `load`,
+`train`, `promote`, `smoke`), composites (`deploy`, `data`, `model`,
+`bootstrap`), verification (`verify`, `query`) and local gates (`check`, `test`,
+`test-fast`). `DATE=` overrides the partition. `make help` is self-documenting
+from the target comments.
+
+**Two things it deliberately does not automate**, and says so at the top of the
+file:
+
+- `apply` never passes `-auto-approve` — a developer reviews the plan (D-07).
+- Promotion still means editing `approved_model_package_arn` by hand, so the
+  deployed version stays a reviewed diff (D-31). `bootstrap` stops at that gate
+  and prints what to do next rather than pretending to finish.
+
+**README restructured** from a reference into a linear guide: prerequisites,
+one-time setup (including creating the state bucket by hand, which cannot be
+managed here), deploy, then a numbered stage-by-stage walkthrough with both the
+`make` target and the underlying command. Added a table listing **every manual
+step with the reason it is manual**, and gave the migrations step its own
+warning — it is not part of `terraform apply`, and missing it is exactly what
+produced the `schema "analytics" does not exist` error in entry 018.
+
+**Verification run:** `make help`, `make test-fast` (123 passed), `make fmt`,
+`make clean` and the `make query` guard all behave; every new script passes
+`bash -n`; all five pre-commit hooks pass. Also swept the README for invisible
+characters and removed a stray U+FEFF.
+
+**Notes**
+
+Accepted as-is. The scripts are written but unrun against AWS — `run_etl.sh`,
+`load_warehouse.sh` and `verify.sh` have not yet made a real call, so their
+first use is also their first test.
+
+---
+
+### 020 — README complete from a clean machine
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `scripts/preflight.sh` (new), `Makefile`, `requirements-dev.txt`, `README.md`, `CLAUDE.md`, `PROJECT_SCOPE.md`, `TODO.md`
+
+**Prompt**
+
+```text
+include steps for installing make, in the event the next developer does not have it. in short, a developer should be able to clone the repo and have all the needed steps to run all the commands and end with a successful deployment of the infrastructure and running and testing the pipeline. however do not run any of this yourself, i will run and test the accuracy and reliability of the readme
+```
+
+**Output**
+
+Nothing was executed against AWS and no `make` target was run, per the
+instruction. Verification was limited to static checks on the files themselves.
+
+Working backwards from "clone on a clean machine" surfaced three gaps beyond the
+`make` question:
+
+1. **`pre-commit` was assumed to be on PATH.** `make install` printed a note
+   telling you to go and get it, which is not setup. Moved it into
+   `requirements-dev.txt` and pointed the Makefile at `venv/bin/pre-commit`, so
+   `make install` now produces a working gate. `make check` fails with
+   `run 'make install' first` rather than a confusing missing-binary error.
+2. **`tflint` and `checkov` were never mentioned at all**, though the Terraform
+   hooks shell out to them. Now listed, with the honest note that you can deploy
+   and run the entire pipeline without them — they gate commits, not deploys.
+3. **The AWS CLI on apt is v1**, which is not what the scripts expect. The
+   Ubuntu instructions install v2 from the official archive and say why.
+
+Added **`scripts/preflight.sh`** and `make preflight`: checks every tool, warns
+on a Terraform or AWS CLI version that will not work, confirms credentials, and
+checks the state bucket exists *with versioning on*. It reports everything at
+once rather than failing one tool at a time.
+
+**README** now opens the setup with per-platform toolchain installation —
+macOS (`xcode-select --install` for `make` itself), Ubuntu/Debian,
+Fedora/RHEL, and WSL2 for Windows — followed by clone, authenticate, create the
+state bucket, and preflight. Added a **Without `make`** section mapping every
+target to the command behind it, which doubles as documentation of what the
+automation actually does.
+
+**Verification run (static only):** every script passes `bash -n`; a script
+compared the Makefile's targets against the README table (all 26 documented,
+none stale); another checked that every `scripts/*.sh` and `sql/*.sql` path
+named in the README exists, and that no script on disk goes unmentioned; a third
+resolved all internal anchors and relative file links, which caught one broken
+link. All five pre-commit hooks pass.
+
+**Notes**
+
+Accepted as-is. Fixed a quoting bug in `preflight.sh` where an apostrophe in
+"README's" terminated a single-quoted `printf` — caught by adding a `bash -n`
+sweep over every script rather than the one just written. The README's accuracy
+end to end is untested by me by request; `make preflight` is the cheapest first
+thing to try, since it is read-only.
+
+---
+
+### 021 — `make etl` failed on a successful run
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `scripts/{run_etl,load_warehouse,promote_model}.sh`, `tests/test_scripts.py` (new), `TODO.md`
+
+**Prompt**
+
+```text
+i received this but i can confirm the job ran successfully [make data output ending in]
+processed partitions:
+                             PRE ingest_date=2026-08-27/
+make: *** [etl] Error 1
+```
+
+**Output**
+
+The Glue job did succeed. The bug was mine, in `run_etl.sh`, and it fired
+**only when there were zero rejected rows** — the good case.
+
+`aws s3 ls` exits 1 when a prefix does not exist. A clean run leaves no
+`_rejected/` prefix, so under `set -euo pipefail` the assignment
+
+```bash
+REJECTS=$(aws s3 ls "s3://.../_rejected/..." 2>/dev/null | wc -l | tr -d ' ')
+```
+
+took the pipeline's non-zero status and `set -e` killed the script one line
+after it printed the partitions. Reproduced it in isolation before changing
+anything.
+
+**Audited every script for the same class rather than fixing the one report**,
+which found two more, both worse than the original because they made the
+guidance unreachable:
+
+- `load_warehouse.sh` — `aws s3 ls` *and* `grep` both exit 1 when there is
+  nothing to find, so with no partitions the script died before printing
+  "Run the ETL first: make etl".
+- `promote_model.sh` — same shape; its "no PendingManualApproval versions, run
+  `scripts/train_model.sh` first" message could never print.
+
+Also hardened `run_etl.sh`'s poll loop: a transient error reading the job state
+used to abort the wait on a job that was running perfectly well. It now retries
+five times before giving up.
+
+Left alone the assignments where failure genuinely *should* abort — a failed
+`start-job-run`, a bad model-package ARN, a Data API call that will not execute.
+`set -e` is right there; the bug is only where empty is a normal answer.
+
+Added **`tests/test_scripts.py`** (44 tests): every script parses, is
+executable and has a shebang; no `set -e` script assigns from an `aws s3 ls` or
+`grep` substitution without a `||` fallback; every script the Makefile calls
+exists; every target is documented and `.PHONY`; and `apply` never gains
+`-auto-approve`. Confirmed the regression test fails when the bug is
+reintroduced, then passes again.
+
+That last test caught its own false positive on the first run — the Makefile
+header *explains* that `-auto-approve` is deliberately absent, so the check now
+strips comments and looks only at recipe lines.
+
+**Verification run:** 198 tests pass; all five pre-commit hooks pass. Nothing
+was run against AWS.
+
+**Notes**
+
+Accepted as-is. The ETL run itself was fine and wrote
+`ingest_date=2026-08-27`, so there is no need to repeat it — `make migrate load`
+picks up from there.
+
+---
+
+### 022 — Warehouse load timed out: enhanced VPC routing
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `envs/dev/terraform.tfvars`, `envs/dev/variables.tf`, `README.md`, `PROJECT_SCOPE.md`, `TODO.md`
+
+**Prompt**
+
+```text
+make data [... migrations applied, then]
+--- sql/load_orders.sql
+    FAILED
+"Error": "Query #2 failed with ERROR: AwsClientException: - Failed to perform
+AWS request, curlError=Connection timeout after 30002 ms"
+```
+
+**Output**
+
+The prediction recorded when phase 3 was built — that `enhanced_vpc_routing`
+would be the first suspect in an opaque timeout — was correct on the first real
+load.
+
+**Diagnosis.** The `DELETE` finished; the `INSERT ... SELECT FROM
+processed_ext.takehome_orders` timed out. Only the second statement reads
+outside Redshift. Checked the deployed network config rather than guessing: the
+VPC has **one** egress rule (S3 prefix list, 443), **one** gateway endpoint (S3),
+and no NAT. With enhanced VPC routing on, Spectrum's traffic is subject to that
+security group — and resolving an external table needs the **Glue Data Catalog**,
+not just S3 `GetObject`. That call had nowhere to go and hung until the 30-second
+curl timeout.
+
+**Fix:** `redshift_enhanced_vpc_routing = false`, with the reasoning inline in
+`terraform.tfvars` rather than as a bare flag flip. Redshift's S3 traffic now
+uses the managed network — still TLS, still scoped by the IAM role and the
+bucket's TLS-only policy; it simply does not traverse our VPC. Also changed the
+variable's default to `false` so a fresh environment works out of the box, and
+rewrote its description to say what turning it on actually requires.
+
+Doing it properly means interface endpoints for Glue and probably STS/KMS, at
+roughly $7/month per endpoint per AZ — about $60/month across three AZs, in an
+environment whose whole design premise is idling near zero. Recorded as
+**T-3.14** with that arithmetic, rather than presenting it as a free security
+win. D-37 was amended, since it had been written assuming the endpoint path
+worked.
+
+Noted for the user that **nothing partial landed**: the Data API runs a file's
+statements in one transaction, so the failed `INSERT` rolled the `DELETE` back
+with it. That was a deliberate property of the load design and it held.
+
+Added a **Troubleshooting** section to the README covering this, the missing-
+migrations error from entry 018, expired SSO tokens, the Redshift usage limit
+presenting as an outage, serverless cold starts, and where to find Glue logs and
+rejected rows.
+
+**Verification run:** `terraform validate` passes; all five pre-commit hooks
+pass. Nothing was run against AWS — the apply is the user's.
+
+**Notes**
+
+Accepted as-is. The change is a one-line tfvars edit plus a default change; it
+needs `make apply` before `make load` will work. Worth noting that the guard
+paid off: the variable existed specifically so this failure would be one flip to
+diagnose rather than a network investigation.
+
+---
+
+### 023 — `Redshift endpoint is not available`
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `scripts/{redshift_sql,redshift_query,verify}.sh`, `README.md`, `TODO.md`
+
+**Prompt**
+
+```text
+make load
+--- sql/load_orders.sql
+An error occurred (ValidationException) when calling the BatchExecuteStatement
+operation: Redshift endpoint is not available.
+```
+
+**Output**
+
+A different failure from the previous one, and almost certainly transient:
+turning off `enhanced_vpc_routing` modifies the workgroup, and a workgroup in
+`MODIFYING` rejects statements with exactly this message. It says nothing about
+waiting, which is the problem.
+
+Checked whether the scripts guarded against it — `grep -c get-workgroup` in both
+returned 0. They did not. A workgroup that is `CREATING` or `MODIFYING` produced
+an opaque error and the script simply died.
+
+Added `wait_for_workgroup()` to `redshift_sql.sh` and `redshift_query.sh`: polls
+until `AVAILABLE`, announces the wait once rather than per iteration, gives up
+after ten minutes, and on any *other* status prints the thing worth knowing —
+that the usage limit deactivates the workgroup on breach, so a sudden failure
+may be a spend guard rather than an outage. Duplicated in both scripts rather
+than extracted, matching how `tf_output` is already handled and keeping each
+script independently runnable.
+
+**Tested the function against all three paths** with a stubbed `aws`. The first
+attempt at the MODIFYING → AVAILABLE case reported a false failure, and the
+fault was in the test, not the function: `$(aws ...)` runs in a subshell, so a
+counter incremented inside it never persisted and the stub returned `MODIFYING`
+forever. Re-tested with a file-based counter; all three paths — immediate
+availability, wait-then-proceed, and give-up — behave correctly.
+
+Also added the workgroup status to `scripts/verify.sh`, since everything in the
+warehouse section depends on it and a `MODIFYING` workgroup would otherwise
+present as several unrelated failures. Extended the README's troubleshooting
+with the error text and how to tell "wait" from "deactivated".
+
+**Verification run:** every script parses; 44 script tests pass; all five
+pre-commit hooks pass. Nothing was run against AWS.
+
+**Notes**
+
+Accepted as-is. The diagnosis is inferred rather than confirmed — the workgroup
+status has not been checked directly, and the alternative (a breached usage
+limit) produces the same client-side error. Both are covered: retrying now waits
+automatically, and a non-transient status prints what to look at.
+
+---
+
+### 024 — Network isolation is not supported on Serverless Inference
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `envs/dev/{inference,variables}.tf`, `README.md`, `PROJECT_SCOPE.md`, `TODO.md`
+
+**Prompt**
+
+```text
+[terraform apply output ending in]
+api error ValidationException: The network isolation is not supported for
+serverless endpoint. Please disable the network isolation.
+```
+
+**Output**
+
+My error, and an avoidable one. In entry 016 I recorded uncertainty about
+whether network isolation was supported on serverless, then defaulted it to
+`true` anyway — while in the same change *correctly* skipping `CKV_AWS_98` for
+precisely the same "not supported on serverless" reason. Two checkov findings of
+the same class, treated inconsistently; the one I "fixed" is the one that failed.
+
+**Fix:** `endpoint_network_isolation` now defaults to `false`, with a
+description saying it is an API-level incompatibility rather than a preference.
+Took the `CKV_AWS_370` skip with that reason, matching how `CKV_AWS_98` was
+already handled, and noting the container reaches nothing anyway — the pipeline
+scores in memory and the execution role grants S3 and ECR only.
+
+**Audited the rest of the inference stack for the same class**, so a third
+failure does not surface on the next apply: checked the endpoint configuration
+for `kms_key_arn`, `data_capture_config`, `async_inference_config`,
+`initial_instance_count`, `instance_type`, `accelerator_type`, `vpc_config` and
+`volume_size_in_gb`. The only hit was `kms_key_arn` inside the CKV_AWS_98 skip
+comment; confirmed by a second grep that there is no assignment. The endpoint
+configuration is otherwise clean for serverless.
+
+Amended **D-29** to record what choosing serverless actually gives up — network
+isolation and endpoint-config KMS, both rejected at the API — rather than
+leaving that as two unexplained skips, and opened **T-5.13** to restore both if
+the endpoint ever becomes provisioned.
+
+**Verification run:** `terraform validate` passes; all five pre-commit hooks
+pass, checkov clean with the new skip. Nothing was run against AWS.
+
+**Notes**
+
+Accepted as-is. The model resource was created before the failure with
+isolation enabled, so the next apply replaces it — harmless, since nothing
+references it yet. Re-run `make apply`.
+
+---
+
+### 025 — `Cannot create already existing model`
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `envs/dev/inference.tf`, `README.md`, `TODO.md`
+
+**Prompt**
+
+```text
+[terraform apply output]
+api error ValidationException: Cannot create already existing model
+"arn:aws:sagemaker:...:model/sandbox-dev-refund-risk-f599dbef".
+```
+
+**Output**
+
+**Cause: `create_before_destroy` propagation.** The endpoint configuration sets
+it, and Terraform extends that to resources it depends on when those also need
+replacing. SageMaker models are wholly immutable, so flipping
+`enable_network_isolation` replaced the model — and because the replacement was
+created *before* the original was destroyed, into a name derived only from the
+package ARN, the name had not changed. Hence a collision with itself. The
+two-minute "Still creating" was the provider retrying.
+
+**First fix attempt was wrong and `terraform validate` caught it:**
+`aws_sagemaker_model` has no `name_prefix` argument, which is the usual way to
+get a distinct name per revision.
+
+**Actual fix:** derive the name from a hash of every argument the resource sets
+— the package ARN, the isolation flag and the execution role — so any change
+that forces replacement also changes the name, and old and new can coexist for
+the moment the swap takes. Reproduced the hashing in Python to confirm: the old
+scheme yields `f599dbef`, exactly the name in the error, which validates the
+diagnosis; the new scheme yields `7e028ff2`, so the swap will not collide. Made
+`create_before_destroy` explicit on the model rather than leaving it implicit,
+so removing it from the endpoint configuration cannot silently reintroduce this.
+
+The version fingerprint moved to a `ModelPackageVersion` tag, since the name no
+longer carries it alone — that is how a running endpoint is traced back to the
+registry version it serves.
+
+**Audited the other resources for the same latent bug.** `aws_sagemaker_endpoint`
+also has a fixed name and depends on the endpoint configuration, but
+`endpoint_config_name` updates in place, so the endpoint is never replaced by a
+config change and no propagation reaches it. Nothing else with a fixed name sits
+under a `create_before_destroy` dependency.
+
+Added the README troubleshooting entry, including the requirement that a new
+argument on the model must be added to the fingerprint, and how to clean up a
+model orphaned by a failed apply.
+
+**Verification run:** `terraform validate` passes; all five pre-commit hooks
+pass. Nothing was run against AWS.
+
+**Notes**
+
+Accepted as-is. Whether the old `f599dbef` model becomes an orphan depends on
+whether it is still in state: if it is, this apply destroys it after the swap;
+if the failed apply lost it, the README now says how to remove it by hand.
+
+---
+
+### 026 — API Gateway stage: account-level CloudWatch Logs role
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `envs/dev/api.tf`, `README.md`, `PROJECT_SCOPE.md`, `TODO.md`
+
+**Prompt**
+
+```text
+[terraform apply — endpoint InService, then]
+Error: updating API Gateway Stage: BadRequestException: CloudWatch Logs role ARN
+must be set in account settings to enable logging
+```
+
+**Output**
+
+The endpoint reached `InService` and the Lambda and integration were created, so
+this is the last resource in the chain.
+
+**Cause.** API Gateway refuses to attach a log destination to a stage unless the
+*account* has a CloudWatch Logs role configured. It is a prerequisite for both
+the stage's `access_log_settings` and the method settings' `logging_level`,
+neither of which works without it.
+
+**Fix.** Added an IAM role trusted by `apigateway.amazonaws.com`, an
+`aws_api_gateway_account` pointing at it, and a `depends_on` from the stage so
+the ordering is explicit rather than incidental. Wrote the policy out instead of
+attaching `AmazonAPIGatewayPushToCloudWatchLogs`, matching how IAM is handled
+everywhere else here — the managed policy grants everything on `*`, and all but
+`logs:DescribeLogGroups` can be scoped to this account and region.
+
+**The part worth flagging.** `aws_api_gateway_account` is **account-wide and
+region-wide**. This stack now owns a setting that is not scoped to it:
+destroying the stack disables CloudWatch logging for every API Gateway API in
+the account, and a second stack configuring it would fight this one. That is a
+bigger blast radius than anything else in this project, and it is only
+acceptable because the account is dedicated to it. Recorded in D-30, in the
+README, and as **T-5.15** — it belongs in a bootstrap configuration alongside
+the state bucket before this pattern is used in a shared account.
+
+**Verification run:** `terraform validate` passes; all five pre-commit hooks
+pass, checkov clean with the split `DescribeLogGroups` statement. Nothing was
+run against AWS.
+
+**Notes**
+
+Accepted as-is. The remaining resources after the stage — method settings, usage
+plan and usage plan key — all depend on the stage and needed the same account
+setting, so this should be the last blocker in the apply.
+
+---
+
+### 027 — Pipeline green end to end, and an information leak it exposed
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `lambda/predict/handler.py`, `envs/dev/{api,variables}.tf`, `scripts/smoke_test_endpoint.sh`, `tests/{test_predict_lambda,test_train}.py`, `PROJECT_SCOPE.md`, `TODO.md`
+
+**Prompt**
+
+```text
+make smoke
+[... all checks passed, including]
+  ok    missing required field -> 400
+        {"error": "Received server error (500) from model with message \"<!DOCTYPE HTML ...
+        See https://...console.aws.amazon.com/cloudwatch/... in account 823878989845 ..."}
+```
+
+**Output**
+
+The pipeline is green end to end — raw CSV through Glue, Parquet, Redshift,
+training, the registry, the endpoint, and a public API call returning a
+calibrated probability. Every smoke check passed.
+
+**One of those passes was hiding a real defect.** The `missing required field`
+case returned the right status code and a body containing an HTML error page,
+the **AWS account id**, the endpoint name and a CloudWatch console URL — to an
+unauthenticated external caller.
+
+Two mistakes of mine met here. The handler passed `ModelError` text through on
+the reasoning, recorded in entry 016, that "its message names the missing
+fields, so it is worth passing back" — but SageMaker wraps the container's
+response, and the wrapper is what carries the account id. And the smoke test
+asserted only the status code, so it reported `ok` on a leaking response.
+
+**Fixes:**
+
+- **Validate at the edge.** The proxy now checks required fields itself, so a
+  bad request gets a clean 400 naming the missing fields and never wakes the
+  endpoint. The field list comes from Terraform (`predict_required_fields`) and
+  a test asserts it matches `train.FEATURES` — the same drift guard already used
+  between the training view and the training script.
+- **Never echo `ModelError`.** The detail is logged; the caller gets a generic
+  message.
+- **Assert bodies, not status codes.** The smoke test now fails any response
+  containing the account id, the endpoint name, a console URL, `DOCTYPE` or
+  `Traceback`.
+
+Added regression tests for all three, including one that feeds the proxy the
+exact wrapper text from this run and asserts none of its four identifiers
+survives into the response body.
+
+**Verification run:** 201 tests pass; all five pre-commit hooks pass. Nothing
+was run against AWS — the redeploy is the user's.
+
+**Notes**
+
+Accepted as-is. Worth stating plainly: a green test suite reported this as
+working. It took reading the output to notice, which is an argument for
+assertions that check what was actually returned rather than that something was
+returned. The endpoint needs `make apply` to pick up the new Lambda before
+`make smoke` will show the corrected behaviour.
+
+---
+
+### 028 — Leak fix confirmed; tracker reconciled
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `TODO.md`, `README.md`, `PROJECT_SCOPE.md`
+
+**Prompt**
+
+```text
+make smoke
+[... all checks passed, with]
+  ok    missing required field -> 400
+        {"error": "instance 0 is missing required fields: ['channel', 'category',
+         'quantity', 'unit_price_usd', 'discount_pct', 'order_dow']"}
+```
+
+**Output**
+
+The leak is closed. The missing-field case now returns a message that names the
+fields and contains nothing from SageMaker's error wrapper — no account id, no
+console URL, no HTML.
+
+Reconciled the tracker, which had drifted behind reality. **T-1.10, T-3.7,
+T-3.8, T-4.7, T-4.9 and T-4.10 were still marked open despite having
+demonstrably happened** — the endpoint serves a model trained from
+`ml.orders_training`, which reads through `analytics.orders` to
+`landing.orders`, so training could not have produced a working model unless
+data had landed, the migrations had applied and the warehouse had been loaded.
+Closed them with that reasoning recorded rather than silently ticking boxes.
+
+T-3.7 and T-3.8 in particular had been *reopened* in entry 018 after the
+`schema "analytics" does not exist` failure; they are now genuinely done.
+
+Rewrote the Now section, which still described work already finished, around
+what actually remains: verifying the two warehouse properties that need a second
+load to observe, the absence of any budget alarm now that everything is
+deployed and idling, and the two pieces of deliberate temporary state
+(T-2.10, T-2.16). Updated the status blocks in the README and the scope, both of
+which still said training had not run.
+
+**Progress: 71 done, 35 open.**
+
+**Verification run:** all five pre-commit hooks pass. Nothing was run against
+AWS.
+
+**Notes**
+
+Accepted as-is. The highest-value remaining item is not a feature: phase 6 has
+not started, so a fully deployed environment has no budget alarm and no failure
+alerting. The Redshift usage limit is the only automatic guard and it covers one
+service.
