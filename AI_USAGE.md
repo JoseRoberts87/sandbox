@@ -442,3 +442,161 @@ Accepted as-is, unapplied. The two suppressions are different in kind and are
 labelled as such: CKV_AWS_300 is a tool limitation with reproduction steps
 recorded, CKV_AWS_99 is a genuine gap with a tracked task. Neither should be
 removed without re-checking the reasoning.
+
+---
+
+### 008 — Real dataset: declared schema, cleaning rules, and quarantine
+
+- **Date:** 2026-08-26
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `glue/jobs/raw_to_processed.py`, `docs/dataset-takehome-orders.md` (new), `docs/data-layout.md`, `envs/dev/{glue,variables}.tf`, `envs/dev/terraform.tfvars`, `TODO.md`, `PROJECT_SCOPE.md`
+
+**Prompt**
+
+```text
+i added a file at /Users/jrob/repos/scraps/sandbox/data/dpe_interview_takehome_data.csv, use this data to update raw_to_processed.py
+```
+
+**Output**
+
+Profiled the file before writing any code — 19 rows, 13 columns — and found it
+seeded with deliberate defects:
+
+| Problem | Detail |
+|---|---|
+| Four timestamp formats in one column | `yyyy-MM-dd HH:mm:ss` (10), `MM/dd/yyyy` (4), `dd-MMM-yyyy` (3), ISO-8601 with `T…Z` (2) |
+| Currency symbol in a numeric column | `$159.28` in `unit_price_usd` |
+| Case variants | `region` 7 distinct → 4 real; `channel` 6 → 4 |
+| Whitespace padding | `category` 10 distinct → 6 real |
+| Blank numeric | one empty `shipping_days` |
+| Cross-row conflict | `SKU-1067` maps to two different products and categories |
+
+`order_id` is unique, and no slash date is ambiguous — every one has a day > 12,
+which is the only reason month-first parsing is safe here.
+
+Rewrote the job around a **declared spec** (`DATASET_SPECS`, keyed
+`"<source>/<dataset>"`) rather than inference: column list, target types, a
+cleaning rule per column, and constraints. CSV is read as all-strings and cast
+deliberately, because `inferSchema` can choose different types for different
+files of the same feed. Datasets without a spec keep the previous generic
+behaviour, so nothing regressed.
+
+Cleaning rules are semantic rather than uniform: `code` (uppercase) for
+identifiers and `region`, `enum` (lowercase) for closed sets and grouping keys
+where case must not create duplicate join values, `text` (case preserved) for
+display strings, `money` for currency stripping.
+
+**The main design decision: bad rows are quarantined, not dropped or nulled.**
+This extends D-20 into three tiers — structural problems fail the run
+immediately; row-level failures are written to
+`_rejected/<source>/<dataset>/ingest_date=.../` with their original values and a
+`reject_reason` listing every reason; the run then fails only if the reject rate
+exceeds `--max_reject_pct` (default 5%). Rejects are written *before* the
+threshold is evaluated, so a failed run still leaves the evidence. Also added
+duplicate-primary-key handling (keep the most recent, quarantine the rest) and
+derived `order_date` / `gross_amount_usd` / `net_amount_usd`.
+
+Fixed two problems found while reviewing the draft: the dedup ordering was
+inferred from column presence rather than declared (now `dedup_order_by` in the
+spec), and a rerun producing zero rejects would have left the previous run's
+rejects in place — an idempotency bug in the reject path.
+
+**Verification run:** Java and pyspark are not installed locally, so the Spark
+job could not be executed. Instead, mirrored the spec's rules in plain Python —
+importing the real `DATASET_SPECS` from the job module with the Glue and Spark
+imports stubbed, so the check reflects the actual spec — and ran it over the
+file: **19 rows in, 19 accepted, 0 rejected**, with all four timestamp formats
+parsed, `$159.28` → `159.28`, regions collapsed to 4, categories to 6, and the
+blank `shipping_days` becoming NULL rather than a reject. Because that exercises
+none of the reject logic, ran a second pass with five deliberately broken rows
+and confirmed each is rejected with the right reason, including one row
+accumulating three reasons. `pre-commit run --all-files` passes all four hooks.
+
+Wired `terraform.tfvars` to `takehome/orders`, added `etl_max_reject_pct`, and
+set `--csv_infer_schema=false`. Wrote `docs/dataset-takehome-orders.md` (schema,
+the profile findings, cleaning rules, derived-column definitions, reject
+behaviour) and documented the `_rejected/` prefix in `docs/data-layout.md`.
+
+**Notes**
+
+Accepted as-is. **The Spark job itself has still never run** — the rules are
+verified, the execution is not (T-2.12). Two assumptions are recorded in the
+dataset doc and tracked as T-2.16: that slash dates are month-first (safe on this
+file, silently wrong if a future file contains `03/04/2025`), and that
+`net_amount_usd = quantity × unit_price × (1 − discount_pct)`.
+
+---
+
+### 009 — pytest suite, and two bugs it found
+
+- **Date:** 2026-08-26
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `tests/{conftest,test_helpers,test_spec,test_transform}.py` (new), `pytest.ini` (new), `requirements-dev.txt` (new), `glue/jobs/raw_to_processed.py`, `README.md`, `CLAUDE.md`, `TODO.md`, `PROJECT_SCOPE.md`
+
+**Prompt**
+
+```text
+i created a venv and installed pyspark, lets add unit tests using pytest
+```
+
+**Output**
+
+Installed `pytest` into the existing `venv/` (it had `pyspark` but no test
+runner). Refactored `main()` first — the row evaluation and column projection
+were inline, so testing them would have meant duplicating the logic. Extracted
+`evaluate_rows()` and `select_clean()`; `main()` now orchestrates and the tests
+call the same functions the job does.
+
+**96 tests in three files:**
+
+- `test_helpers.py` (41) — name normalization and collision disambiguation,
+  `as_bool`, ingest-date resolution including impossible dates like `2025-02-30`,
+  `latest_partition` against a stubbed S3 paginator, and argument resolution
+  including the blank-value-falls-back-to-default case Terraform can produce.
+- `test_spec.py` (24) — invariants over *every* entry in `DATASET_SPECS`, so a
+  dataset added later inherits them. The one that matters most:
+  `allowed` values must match their cleaning rule's casing, because an `enum`
+  column lowercases before comparing and an allowed list containing `"Retail"`
+  would quarantine 100% of rows for no visible reason.
+- `test_transform.py` (31, marked `spark`) — the four timestamp formats, currency
+  and thousands-separator stripping, blank-optional-becomes-NULL, every reject
+  reason, multiple reasons on one row, duplicate-key resolution, derived amounts,
+  and the real sample file end to end (19 rows, 0 rejects, canonical dimension
+  sets, the `$159.28` row, the SKU-1067 conflict warning).
+
+`conftest.py` stubs `awsglue` and `boto3` so the real job module imports locally,
+and provides a Spark fixture that skips cleanly when no JVM is present.
+
+**Two real bugs, both in the job rather than the tests:**
+
+1. **ANSI mode.** The first run failed 8 tests with `CANNOT_PARSE_TIMESTAMP`.
+   Spark 4 enables `spark.sql.ansi.enabled` by default, under which a failed cast
+   or unparseable timestamp *throws* instead of returning NULL. That breaks the
+   entire quarantine design — one bad value would abort the batch rather than be
+   rejected with a reason — and it also breaks multi-format parsing, which
+   coalesces across formats where all but one branch fails by design. Glue 5.0
+   (Spark 3.5) defaults it off, so the job was silently depending on an inherited
+   default it never stated.
+2. **Session timezone.** With that fixed, timestamps still came back a day early:
+   collecting a Spark timestamp converts to the *driver's* local zone. The parse
+   was correct, but it exposed that the job never pinned its session timezone —
+   under a non-UTC session, `ingest_date` bucketing and derived `order_date` can
+   land a day out.
+
+Both are now set explicitly in a new `configure_session()`, which the test
+fixture calls too, so the tests cannot pass under a configuration the deployed
+job does not use.
+
+**Verification run:** `venv/bin/python -m pytest` — **96 passed**;
+`-m "not spark"` — 65 passed in 0.09s; `pre-commit run --all-files` — all four
+hooks pass.
+
+**Notes**
+
+Accepted as-is. `requirements-dev.txt` pins `pyspark==4.2.0`, deliberately newer
+than the Spark 3.5 that Glue 5.0 runs — the stricter runtime is what surfaced the
+ANSI dependency. The divergence is real, though: a bug specific to Spark 3.5
+would not be caught here, tracked as T-X.7. The Glue job itself still has never
+executed against AWS (T-2.12).

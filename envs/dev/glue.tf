@@ -127,10 +127,16 @@ resource "aws_glue_job" "raw_to_processed" {
     "--dataset"            = var.etl_dataset
     "--source_format"      = var.etl_source_format
     "--ingest_date"        = "latest"
+    "--max_reject_pct"     = tostring(var.etl_max_reject_pct)
     "--update_catalog"     = "true"
     "--csv_header"         = "true"
-    "--csv_infer_schema"   = "true"
-    "--required_columns"   = ""
+
+    # Off: takehome/orders declares its schema in the job. Inference is only a
+    # fallback for a dataset with no spec.
+    "--csv_infer_schema" = "false"
+
+    # Required columns come from the dataset spec; this only adds to them.
+    "--required_columns" = ""
   }
 
   tags = {
@@ -168,6 +174,8 @@ resource "aws_glue_crawler" "raw" {
     Name      = "${local.name_prefix}-raw"
     Component = "etl"
   }
+
+  depends_on = [aws_iam_role.glue_crawler]
 }
 
 # --------------------------------- schedule ------------------------------------

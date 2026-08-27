@@ -125,11 +125,20 @@ of what exists. Do not delete it, and do not run applies from two machines.
 ## Tests
 
 ```bash
-pre-commit run --all-files --verbose      # fmt, validate, tflint, checkov
-python3 -m py_compile glue/jobs/*.py      # job scripts parse
+pre-commit run --all-files --verbose      # terraform: fmt, validate, tflint, checkov
+venv/bin/python -m pytest                 # 96 tests: helpers, spec invariants, transform
+venv/bin/python -m pytest -m "not spark"  # 65 of them, no JVM needed, ~0.1s
 ```
 
-No AWS credentials are needed for any of these.
+No AWS credentials are needed for any of these. The Spark tests need a JVM and
+skip automatically without one.
+
+Set up the test environment with:
+
+```bash
+python3 -m venv venv
+venv/bin/python -m pip install -r requirements-dev.txt
+```
 
 ## Project structure
 
@@ -145,6 +154,8 @@ No AWS credentials are needed for any of these.
 ├── glue/
 │   └── jobs/
 │       └── raw_to_processed.py
+├── tests/                  # pytest: helpers, spec invariants, Spark transform
+├── data/                   # sample source data
 ├── envs/
 │   └── dev/                # dev environment root module (local state)
 │       ├── main.tf         # locals

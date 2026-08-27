@@ -26,10 +26,14 @@ glue_timeout_minutes   = 60
 enable_raw_crawler     = true
 
 # --- etl job defaults ---
-# Placeholders until Q-01 tells us the real source and dataset names.
-etl_source_name   = "manual"
-etl_dataset       = "sample"
+# takehome/orders: schema and cleaning rules are declared in
+# glue/jobs/raw_to_processed.py. See docs/dataset-takehome-orders.md.
+etl_source_name   = "takehome"
+etl_dataset       = "orders"
 etl_source_format = "csv"
+
+# A few bad rows are quarantined; a broken feed fails the run.
+etl_max_reject_pct = 5.0
 
 # Schedule stays disarmed until there is real data and a cadence (Q-08).
 etl_schedule_enabled    = false

@@ -75,6 +75,19 @@ Each row carries lineage columns added by the job:
 | `etl_processed_at` | When the job wrote it |
 | `etl_job_run_id` | The Glue job run that produced it |
 
+#### Rejected rows
+
+Rows the ETL could not parse or that violated a constraint are quarantined under
+a reserved top-level prefix in the same bucket, never mixed in with clean data:
+
+```
+s3://<project>-<env>-processed-<suffix>/_rejected/<source>/<dataset>/ingest_date=YYYY-MM-DD/
+```
+
+Each row keeps its original untouched values and gains a `reject_reason` column.
+The prefix is partitioned and rewritten exactly like the clean data, so rerunning
+a date clears that date's rejects — including when the rerun produces none.
+
 ### Artifacts — `s3://<project>-<env>-artifacts-<suffix>/`
 
 Not a data zone. Fixed prefixes:

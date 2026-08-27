@@ -1,0 +1,12 @@
+# Local development and test dependencies only.
+#
+# Glue provides its own runtime, so nothing here is deployed. Install with:
+#   python3 -m venv venv && venv/bin/python -m pip install -r requirements-dev.txt
+#
+# pyspark 4.x is deliberately newer than the Spark 3.5 that Glue 5.0 runs. It
+# enables ANSI mode by default, which surfaced a real dependency the job had on
+# null-on-failure cast semantics — see configure_session() in the job. Testing
+# on the stricter runtime is worth the divergence, but it does mean a bug
+# specific to Spark 3.5 would not be caught here.
+pytest==9.1.1
+pyspark==4.2.0
