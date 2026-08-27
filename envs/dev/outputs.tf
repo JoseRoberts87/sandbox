@@ -67,3 +67,33 @@ output "etl_schedule_state" {
   description = "Whether the ETL schedule is currently armed."
   value       = aws_scheduler_schedule.raw_to_processed.state
 }
+
+output "redshift_workgroup_name" {
+  description = "Redshift Serverless workgroup, for the Data API."
+  value       = aws_redshiftserverless_workgroup.main.workgroup_name
+}
+
+output "redshift_namespace_name" {
+  description = "Redshift Serverless namespace."
+  value       = aws_redshiftserverless_namespace.main.namespace_name
+}
+
+output "redshift_database_name" {
+  description = "Database to target with --database on Data API calls."
+  value       = aws_redshiftserverless_namespace.main.db_name
+}
+
+output "redshift_admin_secret_arn" {
+  description = "Secrets Manager ARN holding the AWS-managed admin credentials."
+  value       = aws_redshiftserverless_namespace.main.admin_password_secret_arn
+}
+
+output "redshift_role_arn" {
+  description = "IAM role Redshift assumes for S3 and Glue catalog access. Needed by CREATE EXTERNAL SCHEMA."
+  value       = aws_iam_role.redshift.arn
+}
+
+output "redshift_endpoint" {
+  description = "Workgroup endpoint. Unused while everything goes through the Data API."
+  value       = try(aws_redshiftserverless_workgroup.main.endpoint[0].address, null)
+}

@@ -293,3 +293,105 @@ resource "aws_iam_role_policy" "scheduler" {
   role   = aws_iam_role.scheduler.id
   policy = data.aws_iam_policy_document.scheduler.json
 }
+
+# -----------------------------------------------------------------------------
+# Redshift (T-3.3)
+#
+# Reads the processed zone and its Glue catalog entries, so Spectrum can query
+# the Parquet in place and load from it. Write access to nothing: the warehouse
+# consumes the lake, it does not modify it.
+# -----------------------------------------------------------------------------
+
+data "aws_iam_policy_document" "redshift_assume_role" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["redshift.amazonaws.com", "redshift-serverless.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+  }
+}
+
+resource "aws_iam_role" "redshift" {
+  name               = "${local.name_prefix}-redshift"
+  description        = "Lets Redshift read the processed zone and its catalog."
+  assume_role_policy = data.aws_iam_policy_document.redshift_assume_role.json
+
+  tags = {
+    Name      = "${local.name_prefix}-redshift"
+    Component = "warehouse"
+  }
+}
+
+data "aws_iam_policy_document" "redshift" {
+  statement {
+    sid       = "ReadProcessed"
+    effect    = "Allow"
+    actions   = ["s3:GetObject", "s3:GetObjectVersion"]
+    resources = ["${module.processed.arn}/*"]
+  }
+
+  statement {
+    sid       = "ListProcessed"
+    effect    = "Allow"
+    actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
+    resources = [module.processed.arn]
+  }
+
+  # UNLOAD target for phase 4 training sets.
+  statement {
+    sid       = "WriteTrainingSets"
+    effect    = "Allow"
+    actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+    resources = ["${module.artifacts.arn}/training/*"]
+  }
+
+  statement {
+    sid       = "ListArtifacts"
+    effect    = "Allow"
+    actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
+    resources = [module.artifacts.arn]
+  }
+
+  statement {
+    sid    = "UseS3Key"
+    effect = "Allow"
+    actions = [
+      "kms:Decrypt",
+      "kms:Encrypt",
+      "kms:GenerateDataKey*",
+      "kms:DescribeKey",
+    ]
+    resources = [aws_kms_key.s3.arn]
+  }
+
+  # Spectrum reads table and partition metadata from the Glue catalog.
+  statement {
+    sid    = "ReadCatalog"
+    effect = "Allow"
+    actions = [
+      "glue:GetDatabase",
+      "glue:GetDatabases",
+      "glue:GetTable",
+      "glue:GetTables",
+      "glue:GetPartition",
+      "glue:GetPartitions",
+      "glue:BatchGetPartition",
+    ]
+    resources = local.glue_catalog_arns
+  }
+}
+
+resource "aws_iam_role_policy" "redshift" {
+  name   = "${local.name_prefix}-redshift"
+  role   = aws_iam_role.redshift.id
+  policy = data.aws_iam_policy_document.redshift.json
+}

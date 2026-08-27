@@ -14,9 +14,9 @@ serves predictions from an inference endpoint.
 ## Architecture
 
 ```
-S3 (raw) ──Glue──► S3 (processed) ──COPY──► Redshift ──UNLOAD──► SageMaker ──► inference endpoint
-   ▲          ▲            ▲
-   └── built  └── built    └── built (not applied)
+S3 (raw) ──Glue──► S3 (processed) ──Spectrum──► Redshift ──UNLOAD──► SageMaker ──► endpoint
+   ▲          ▲            ▲                          ▲
+   └─ applied └─ applied   └─ applied (job unverified) └─ written, not applied
 ```
 
 Layout — see [docs/data-layout.md](./docs/data-layout.md):
@@ -243,6 +243,43 @@ is safe to repeat.
 > bucket, neither of which exists yet. The `aws glue get-table` check above
 > verifies the catalog without them.
 
+### Loading the warehouse
+
+Terraform creates Redshift but not its schemas (D-38). Apply the migrations once
+after `terraform apply`, then load a snapshot after each ETL run:
+
+```bash
+# once — schemas, the Spectrum external schema, landing.orders, analytics.orders
+scripts/redshift_sql.sh sql/migrations
+
+# after each ETL run, for the partition it wrote
+scripts/redshift_sql.sh sql/load_orders.sql ingest_date=$(date -u +%F)
+```
+
+The load is `DELETE` + `INSERT ... SELECT` on one partition, so re-running a date
+replaces it rather than duplicating — the same contract the ETL has with S3.
+
+Query it:
+
+```bash
+aws redshift-data execute-statement \
+  --workgroup-name "$(terraform -chdir=envs/dev output -raw redshift_workgroup_name)" \
+  --database     "$(terraform -chdir=envs/dev output -raw redshift_database_name)" \
+  --secret-arn   "$(terraform -chdir=envs/dev output -raw redshift_admin_secret_arn)" \
+  --sql "SELECT count(*) AS orders, sum(net_amount_usd) AS net FROM analytics.orders"
+```
+
+> **Query `analytics.orders`, not `landing.orders`.** Every `ingest_date`
+> partition is a full snapshot, so the table holds each order once per run. The
+> view pins the newest snapshot and is what "the orders table" should mean.
+
+> **Cost.** Redshift Serverless is the first component here that bills
+> meaningfully — roughly $0.36 per RPU-hour while queries run, at a floor of 8
+> RPUs. A monthly usage limit of `redshift_monthly_rpu_hours` is set to
+> **deactivate** the workgroup on breach, so a runaway query cannot produce a
+> surprise bill. If queries start failing for no clear reason, check the usage
+> limit before assuming an outage.
+
 ### Discovering a schema
 
 The raw crawler is on-demand and exists only to answer "what is actually in this
@@ -297,7 +334,8 @@ venv/bin/python -m pip install -r requirements-dev.txt
 │       └── raw_to_processed.py
 ├── tests/                  # pytest: helpers, spec invariants, Spark transform
 ├── data/                   # sample source data
-├── scripts/                # land_sample_data.sh
+├── scripts/                # land_sample_data.sh, redshift_sql.sh
+├── sql/                    # Redshift DDL migrations + the partition load
 ├── envs/
 │   └── dev/                # dev environment root module
 │       ├── backend.tf      # remote state; remove this file to go local

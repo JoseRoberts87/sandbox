@@ -179,6 +179,23 @@ it; the deployed script always matches the commit.
 **IAM is written explicitly**, not via `AWSGlueServiceRole`, which grants access
 to `aws-glue-*` buckets we do not own.
 
+**The warehouse loads through Spectrum, not COPY.** `COPY` cannot populate a
+partition column and `ingest_date` is only an S3 path segment, so `sql/` defines
+an external schema over the Glue catalog and the load is `DELETE` +
+`INSERT ... SELECT` for one partition — idempotent, mirroring how the ETL
+rewrites that partition in S3. **Query `analytics.orders`, never
+`landing.orders`**: the view pins `MAX(ingest_date)`, and the table holds every
+snapshot, so a direct query counts each order once per run.
+
+**Terraform does not own schema.** DDL is ordered files in `sql/migrations/`,
+applied by `scripts/redshift_sql.sh` through the Data API, deliberately, like an
+apply.
+
+**Redshift Serverless is the only component that can run up a bill on its own.**
+Base capacity is pinned to the 8 RPU floor and a monthly usage limit is set to
+`deactivate` on breach. If queries suddenly fail, check the usage limit before
+assuming an outage.
+
 **The schedule exists but is disabled.** `etl_schedule_enabled = false` until
 cadence is settled (Q-08) and real data is landing.
 
