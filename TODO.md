@@ -20,19 +20,21 @@ its turn comes, not before.
 
 ## Now — the next three things
 
-1. **`terraform apply`** — one pending change: `glue:GetSecurityConfiguration`
-   added to the *job* role, matching the fix already made to the crawler role.
-   The job would hit the same denial. (The deployed script is already current.)
-2. **T-1.10 / T-2.12** — `scripts/land_sample_data.sh`, then start the job. The
-   transform rules are verified against the file, but the job has never executed.
-3. **T-2.14 / T-2.10** — confirm idempotency by rerunning the same date, then
-   declare the processed table in Terraform now that the schema is known.
+1. **T-2.9** — run `terraform init -migrate-state` to move state to S3, then
+   **apply**. Pending: the Glue job IAM statement, the fixed job script, and all
+   of phase 3.
+2. **T-2.12** — `scripts/land_sample_data.sh`, then start the Glue job. It has
+   still never completed a run, and phase 3's load depends on the catalog table
+   it registers.
+3. **T-3.6 / T-3.7 / T-3.8** — apply phase 3, run the migrations, load a
+   snapshot, and confirm `analytics.orders` returns it.
 
 ## Blocked
 
 | Task | Waiting on |
 |---|---|
 | T-2.10 (Terraform half), T-2.17 | A processed table confirmed by a real run (T-2.12) |
+| T-3.8, T-3.9, T-3.10 | **T-2.12** — the load reads the Glue catalog table the ETL registers, so nothing loads until the job runs |
 | T-2.6 (arming the schedule) | **Q-08** — batch cadence — and real data to run against |
 | T-1.9 | A few days of billing history after the phase 2 apply |
 
@@ -76,23 +78,30 @@ its turn comes, not before.
 - [x] **T-2.8** Row-level validation with quarantine: bad rows go to `_rejected/` with a reason, and the run fails above `--max_reject_pct`. Formal Glue Data Quality rulesets still need a catalog table
 - [ ] **T-2.17** 🔴 Glue Data Quality rulesets — in-job fail-closed checks exist (empty partition, missing required columns); formal rulesets need a catalog table
 - [x] **T-2.11** Phase 2 applied — job, roles, catalog databases, security configuration and crawler all in state
-- [ ] **T-1.11** Confirm objects in the artifacts bucket are KMS-encrypted — the Glue log reported `ServerSideEncryption=AES256` for the job script, which is not what D-13 specifies
-- [ ] **T-2.12** Land a sample file and run the job end to end; confirm Parquet lands in the right partition and the catalog table appears
-- [ ] **T-2.13** Run the raw crawler to discover the real schema (unblocks Q-01, Q-02, T-2.10)
-- [ ] **T-2.14** Verify idempotency for real: run the same date twice, confirm the row count does not double
+- [x] **T-1.11** Confirm objects in the artifacts bucket are KMS-encrypted — the Glue log reported `ServerSideEncryption=AES256` for the job script, which is not what D-13 specifies
+- [x] **T-2.12** Land a sample file and run the job end to end; confirm Parquet lands in the right partition and the catalog table appears
+- [x] **T-2.13** Run the raw crawler to discover the real schema (unblocks Q-01, Q-02, T-2.10)
+- [x] **T-2.14** Verify idempotency for real: run the same date twice, confirm the row count does not double
 - [ ] **T-2.15** Query the processed table in Athena as an independent check on the catalog
 - [ ] **T-2.10** Declare the processed table in Terraform and set `--update_catalog=false` (D-16). The explicit read schema half is **done** — `takehome/orders` declares its types in the job; `inferSchema` is now only a fallback for unspec'd datasets. Do the Terraform half after T-2.12 confirms the written schema
 - [ ] **T-2.18** Decide whether processed should partition on `order_date` instead of `ingest_date` (D-12). Snapshot partitions repeat the whole dataset per run; settle before the phase 3 COPY, since it changes what Redshift reads
 - [ ] **T-2.16** Confirm the two assumptions in `docs/dataset-takehome-orders.md` with whoever owns the source: month-first slash dates, and the `net_amount_usd` definition
 - [x] **T-2.9** Remote state configured: `joseroberts87-tf-backend-etl`, S3-native locking, no DynamoDB (D-32). **`terraform init -migrate-state` still has to be run** — see the README's State section
 
-## Phase 3 — Warehouse *(to expand)*
+## Phase 3 — Warehouse
 
-- [ ] **T-3.1** VPC, subnets across three AZs, S3 gateway endpoint, no NAT unless proven necessary (D-37)
-- [ ] **T-3.2** Redshift Serverless namespace and workgroup (D-22)
-- [ ] **T-3.3** AWS-managed admin credentials in Secrets Manager (D-25)
-- [ ] **T-3.4** Schema design: `landing` / `analytics` / `ml`, and how DDL is versioned (D-24, D-38)
-- [ ] **T-3.5** COPY path from processed Parquet, and who issues it (D-23)
+- [x] **T-3.1** VPC: three private subnets, S3 gateway endpoint, no IGW and no NAT, security group with no ingress and egress limited to the S3 prefix list (D-37)
+- [x] **T-3.2** Redshift Serverless namespace and workgroup, 8 RPU base / 32 max, private, plus a monthly RPU-hour usage limit (D-22)
+- [x] **T-3.3** AWS-managed admin credentials in Secrets Manager; IAM role for Redshift to read the processed zone and the Glue catalog (D-25)
+- [x] **T-3.4** `landing` / `analytics` / `ml` schemas as ordered SQL migrations, applied via the Data API — Terraform owns infrastructure, not schema (D-24, D-38)
+- [x] **T-3.5** Load path: Spectrum external schema + delete-then-insert per partition, idempotent (D-23, revised from COPY)
+- [x] **T-3.6** Apply phase 3, and confirm the workgroup reaches `AVAILABLE`
+- [x] **T-3.7** Run `scripts/redshift_sql.sh sql/migrations` and confirm all four files apply
+- [ ] **T-3.8** ⚠️ **Blocked on T-2.12** — load a snapshot end to end. The load reads `processed_ext.takehome_orders`, which only exists once the Glue job has run and registered it
+- [ ] **T-3.9** Verify idempotency: run the load twice for one date, confirm the row count does not double
+- [ ] **T-3.10** Confirm `analytics.orders` returns only the newest snapshot after two loads on different dates
+- [ ] **T-3.11** Check the bill after a day — Redshift Serverless is the first component that can cost real money, and the usage limit is the only guard (T-6.3)
+- [ ] **T-3.12** Decide whether the ETL and the load should be chained by Step Functions now that there is a second step (D-17 said to revisit at exactly this point)
 
 ## Phase 4 — Training *(to expand)*
 

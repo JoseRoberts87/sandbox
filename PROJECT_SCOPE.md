@@ -286,6 +286,8 @@ things we have to get right up front. Provisioned RA3 becomes cheaper only at
 sustained high utilization; we can move later if the bill says so. Note Serverless
 needs subnets in at least three availability zones.
 
+**Decided (2026-08-27):** Redshift Serverless, 8 RPU base (the floor), 32 RPU max, plus an `aws_redshiftserverless_usage_limit` of 40 RPU-hours/month with `breach_action = deactivate`. This is the first component that can run up a bill on its own and there is no budget alarm yet (T-6.3), so the limit is a hard stop rather than a warning. It will look like an outage if it fires — that is the intended trade.
+
 **D-23 — Load mechanism.** Glue writing to Redshift directly over JDBC, or Glue
 writing Parquet to S3 and Redshift `COPY`-ing it?
 *Recommendation:* **write to S3, then COPY.** JDBC writes from Spark are slow,
@@ -295,15 +297,21 @@ can re-load or query with Spectrum. Open sub-question: who issues the COPY — t
 Glue job at the end of its run, or a separate step in the orchestrator? A separate
 step is easier to retry.
 
+**Revised (2026-08-27): loading through Spectrum, not COPY.** `COPY` cannot populate a partition column, and `ingest_date` exists only as an S3 path segment — so a COPY-based load would need a staging table and a literal date injected per run. A Spectrum external schema over the Glue catalog the ETL already maintains exposes `ingest_date` as a real column, which makes the load a plain `DELETE` + `INSERT ... SELECT` on one partition: idempotent, and mirroring exactly how the ETL rewrites that partition in S3. The substance of the original decision stands — data moves S3 → warehouse, never over Spark JDBC — and the processed Parquet is still the durable intermediate.
+
 **D-24 — Schema design.** Proposal: `landing` schema (COPY target, mirrors the
 processed files), `analytics` schema (curated, modelled tables), `ml` schema (the
 exact training views/tables SageMaker reads). Keeping the ML dataset as its own
 versioned object matters for reproducibility — "which rows did model v3 train on"
 should be answerable.
 
+**Decided (2026-08-27):** `landing` (mirrors the processed Parquet), `analytics` (curated), `ml` (empty until Q-02). The one that matters: `analytics.orders` is a view pinned to `MAX(ingest_date)`. Since every partition is a full snapshot (D-12), querying `landing.orders` directly counts each order once per run — the view is the safe entry point, and the table is the history.
+
 **D-25 — Credentials.** AWS-managed admin credentials stored in Secrets Manager,
 so no password is ever written to Terraform state in plaintext. Component access
 uses IAM roles rather than passwords wherever the service supports it.
+
+**Decided (2026-08-27):** `manage_admin_password = true` on the namespace, so AWS generates and holds the credential in Secrets Manager and no password is ever written to Terraform state. The Data API authenticates with the secret ARN.
 
 **D-26 — How SageMaker reads Redshift.** Redshift Data API (IAM-authenticated,
 no VPC connectivity required) or a JDBC connection from inside the VPC?
@@ -408,6 +416,8 @@ and **no NAT gateway** unless something proves it needs one — a NAT gateway is
 constant hourly charge in an environment designed to idle at near-zero. Prefer
 interface endpoints for the specific services that need them.
 
+**Decided (2026-08-27):** a VPC that exists only because Redshift Serverless demands one — three private subnets, an S3 gateway endpoint, **no internet gateway and no NAT**, and a security group with no ingress whatsoever (the Data API is an AWS API call, not VPC traffic). Egress is restricted to the S3 prefix list. `enhanced_vpc_routing` is on, so S3 traffic uses the endpoint; it is behind a variable because it is the first thing to suspect if a load fails with an opaque S3 or KMS timeout.
+
 **D-38 — Terraform's boundary.** Terraform owns infrastructure. It does **not**
 own: data in S3, rows in Redshift, model artifacts, or in-flight job runs. Two
 grey areas to settle deliberately — Glue job *scripts* (Terraform-uploaded, so the
@@ -416,6 +426,8 @@ DDL* (Terraform has no good story for this; a migration tool or a versioned SQL
 directory applied manually is the usual answer).
 
 **Decided for Glue scripts (2026-08-26):** Terraform uploads them (`aws_s3_object` with `source_hash`, not `etag` — KMS-encrypted objects have no MD5 etag), so the deployed script always matches the commit. Redshift DDL is still open.
+
+**Decided for Redshift DDL (2026-08-27):** ordered, re-runnable files in `sql/migrations/`, applied by `scripts/redshift_sql.sh` through the Data API. Terraform does not run them — it owns infrastructure, not schema. Placeholders are filled from terraform outputs, and a file naming one with no value fails rather than substituting an empty string.
 
 **D-39 — Cost guardrails.** An AWS Budget with an alarm at a threshold set from
 Q-07, S3 lifecycle rules, Redshift Serverless auto-pause, Serverless Inference,
@@ -465,11 +477,12 @@ starts before the previous phase is applied and verified.
 Detailed task breakdowns for each phase come later, one phase at a time.
 Live progress against these phases is tracked in [TODO.md](./TODO.md).
 
-**Current status (2026-08-26):** Phases 0 and 1 are applied. Phase 2 (ETL) is
-written and validated but **not yet applied** — processed and artifacts buckets,
-Glue catalog databases, the `raw_to_processed` PySpark job and its execution
-role, an on-demand raw crawler, and a daily schedule created in a disabled
-state.
+**Current status (2026-08-27):** Phases 0–2 are applied, but **phase 2 has never
+completed a run** — the first attempt failed at startup and the fix is not yet
+applied (T-2.12). Phase 3 is written and validated, not applied: VPC, Redshift
+Serverless, IAM, schema migrations and the load path. Phase 3 was started before
+phase 2 was verified, which departs from the rule at the top of §7; the
+dependency is real, since the load reads the Glue catalog table the ETL creates.
 
 ---
 
@@ -499,3 +512,4 @@ state.
 | 2026-08-26 | pytest suite added (96 tests). It caught two implicit runtime dependencies in the job: ANSI mode (a failed cast throws rather than nulling, which would abort a batch and defeat quarantine entirely) and session timezone (date bucketing able to shift a day). Both are now set explicitly in `configure_session()`. |
 | 2026-08-27 | D-12 revised: raw is flat (`<source>/<dataset>/<file>`), processed stays partitioned by `ingest_date` = the run date. Processed partitions are now full snapshots, so consumers read the newest one. `--ingest_date` defaults to `today`; `latest` now resolves against processed, to redo the most recent load. |
 | 2026-08-27 | D-32 closed: state migrated to S3 (`joseroberts87-tf-backend-etl`) with S3-native locking, no DynamoDB. Backend isolated in `backend.tf` so local state stays available for throwaway work. |
+| 2026-08-27 | Phase 3 built: VPC (3 AZs, no NAT), Redshift Serverless with a usage limit, IAM, `sql/` migrations and a Data API runner. D-22, D-24, D-25, D-37 decided; D-38's Redshift half decided; **D-23 revised** — Spectrum + `INSERT ... SELECT` instead of `COPY`, because COPY cannot populate a partition column. |

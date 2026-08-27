@@ -856,3 +856,79 @@ Accepted as-is. Two things assumed and worth confirming: the bucket is in
 `us-east-1` (it must match `region` in `backend.tf`, or init fails), and it
 already has versioning enabled. Nothing was verified against AWS, per the
 standing instruction.
+
+---
+
+### 014 — Phase 3: Redshift Serverless, schemas, and the load path
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `envs/dev/{network,redshift}.tf` (new), `envs/dev/{iam,variables,outputs}.tf`, `envs/dev/terraform.tfvars`, `sql/` (new), `scripts/redshift_sql.sh` (new), `README.md`, `CLAUDE.md`, `PROJECT_SCOPE.md`, `TODO.md`
+
+**Prompt**
+
+```text
+lets now move to phase 3
+```
+
+**Output**
+
+Flagged first that §7's rule — a phase should not start until the previous one is
+verified — is being departed from: the Glue job has still never completed a run
+(T-2.12), and phase 3's load depends on the catalog table that run registers.
+Built phase 3 anyway, as asked, and recorded the dependency in the scope status
+and as a blocker on T-3.8.
+
+**Networking** (`network.tf`) — a VPC that exists only because Redshift
+Serverless requires three AZs. No internet gateway, no NAT (a NAT bills hourly
+forever in an environment meant to idle near zero), an S3 gateway endpoint
+because it is free, a security group with **no ingress at all** since the Data
+API is an AWS API call rather than VPC traffic, and egress restricted to the S3
+prefix list. The default security group is claimed and left empty.
+
+**Redshift** (`redshift.tf`) — Serverless at the 8 RPU floor, 32 RPU ceiling,
+private, `manage_admin_password = true` so the credential lives in Secrets
+Manager and never in state. Added an `aws_redshiftserverless_usage_limit` of 40
+RPU-hours/month with `breach_action = deactivate`: this is the first component
+that can run up a bill unattended and there is no budget alarm yet, so the limit
+is a hard stop. Documented that it will look like an outage if it fires.
+
+**D-23 revised: the load goes through Spectrum, not COPY.** `COPY` cannot
+populate a partition column, and `ingest_date` exists only as an S3 path segment
+— a COPY-based load would need a staging table plus a literal date injected per
+run. A Spectrum external schema over the Glue catalog the ETL already maintains
+exposes `ingest_date` as a real column, making the load a plain `DELETE` +
+`INSERT ... SELECT` for one partition: idempotent, and mirroring exactly how the
+ETL rewrites that partition in S3. The substance of D-23 stands — data moves
+S3 → warehouse, never over Spark JDBC.
+
+**Schemas** (`sql/`) — `landing`, `analytics`, `ml` as ordered, re-runnable
+migrations. The load-bearing piece is `analytics.orders`, a view pinned to
+`MAX(ingest_date)`: because every partition is a full snapshot (D-12), querying
+`landing.orders` directly counts each order once per run. The view is the safe
+entry point and the table is the history — this is the warehouse-side answer to
+the hazard that the flat-raw change introduced.
+
+**`scripts/redshift_sql.sh`** — runs a file or a directory through the Data API,
+substituting `${placeholders}` from terraform outputs and `KEY=VALUE` arguments.
+A file naming a placeholder with no value **fails** rather than substituting an
+empty string, which would otherwise produce SQL like `IAM_ROLE ''`. Statements go
+as one batch, which the Data API runs in a single transaction — so a file applies
+completely or not at all, and the load's delete-then-insert cannot half-apply.
+That is also why the SQL carries no explicit `BEGIN`/`COMMIT`.
+
+**Verification run:** `terraform validate` passes, which confirms every Redshift
+Serverless attribute name against the provider schema. All five pre-commit hooks
+pass with no new checkov findings. Exercised the script's rendering logic offline
+against all five SQL files: statement splitting is correct (3, 1, 1, 1, 2), and a
+missing `ingest_date` fails loudly. 101 tests still pass.
+
+**Notes**
+
+Accepted as-is, unapplied. Two things to watch on first apply: `enhanced_vpc_routing`
+is on, which forces S3 traffic through the gateway endpoint — it is behind a
+variable because it is the first suspect if a load fails with an opaque S3 or KMS
+timeout. And the usage limit deactivates the workgroup on breach, which is
+protective but will present as an outage. T-3.12 was added because D-17 said to
+revisit Step Functions once a second pipeline step existed; the load is that step.

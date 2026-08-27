@@ -161,3 +161,65 @@ variable "etl_schedule_expression" {
   type        = string
   default     = "cron(0 6 * * ? *)"
 }
+
+# ---------------------------------- network -----------------------------------
+
+variable "vpc_cidr" {
+  description = "CIDR for the VPC that exists solely because Redshift Serverless requires one."
+  type        = string
+  default     = "10.20.0.0/16"
+}
+
+# --------------------------------- redshift -----------------------------------
+
+variable "redshift_database_name" {
+  description = "Initial database created in the namespace."
+  type        = string
+  default     = "analytics"
+}
+
+variable "redshift_admin_username" {
+  description = "Admin user. The password is generated and held by Secrets Manager, never by Terraform (D-25)."
+  type        = string
+  default     = "admin_user"
+}
+
+variable "redshift_base_capacity" {
+  description = "Base RPUs. 8 is the minimum Redshift Serverless allows, and the right starting point until there is a reason to go higher."
+  type        = number
+  default     = 8
+
+  validation {
+    condition     = var.redshift_base_capacity >= 8 && var.redshift_base_capacity % 8 == 0
+    error_message = "Base capacity must be at least 8 RPUs and a multiple of 8."
+  }
+}
+
+variable "redshift_max_capacity" {
+  description = "Ceiling on RPUs a query may scale to. Caps the cost of one bad query."
+  type        = number
+  default     = 32
+}
+
+variable "redshift_monthly_rpu_hours" {
+  description = "Monthly RPU-hour allowance before the breach action fires. 8 RPUs running for an hour costs 8 RPU-hours."
+  type        = number
+  default     = 40
+}
+
+variable "redshift_usage_breach_action" {
+  description = "What happens when the usage limit is hit: log, emit-metric or deactivate. `deactivate` stops queries — the right default while there is no budget alarm, but it will look like an outage if it fires unexpectedly."
+  type        = string
+  default     = "deactivate"
+
+  validation {
+    condition     = contains(["log", "emit-metric", "deactivate"], var.redshift_usage_breach_action)
+    error_message = "Breach action must be log, emit-metric or deactivate."
+  }
+}
+
+variable "redshift_enhanced_vpc_routing" {
+  description = "Force S3 traffic through the VPC's gateway endpoint. Keeps COPY/UNLOAD off the managed network; set false to diagnose an S3 or KMS timeout during a load."
+  type        = bool
+  default     = true
+}
