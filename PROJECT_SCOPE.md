@@ -319,6 +319,8 @@ no VPC connectivity required) or a JDBC connection from inside the VPC?
 putting the training job in the VPC, avoids a NAT gateway, and the UNLOADed
 snapshot is exactly the reproducible training artifact D-24 asks for.
 
+**Decided (2026-08-27):** `UNLOAD` through the Data API to a versioned prefix, `s3://<artifacts>/training/<version>/`. SageMaker trains from those files, so it needs no VPC attachment and no NAT — and the UNLOADed snapshot *is* the reproducible artifact, which is what makes "which rows did this model learn from" answerable.
+
 ### ML
 
 **D-27 — Where feature engineering lives.** In Glue/Redshift (features are columns
@@ -330,12 +332,20 @@ historical features are computed in the warehouse; only row-local transforms
 (scaling, encoding) live in the model artifact, packaged with the model so
 training and inference use the identical code path. **Depends on Q-02/Q-03.**
 
+**Decided (2026-08-27).** The split runs along one line: **row selection and labelling in the warehouse, row-local transforms in the model artifact.**
+
+`ml.orders_training` (SQL, reviewable in a diff) chooses the rows, defines the label, and excludes leakage. The model artifact is a single sklearn `Pipeline` containing imputation, encoding, scaling *and* the classifier — so inference physically cannot apply different preprocessing from training, because there is one object and one code path. Splitting them is how training/serving skew happens, and it looks fine offline.
+
+Leakage exclusions are documented in the view rather than inferred: `shipping_days` is unknown at scoring time; `pending` orders are excluded because they have not resolved, and at scoring time every new order is pending; the hour of `order_ts` is excluded because 7 of 19 source rows carry a date with no time, so hour would encode which timestamp format the row arrived in — a property of our ETL, not of the order.
+
 **D-28 — Training approach.** SageMaker built-in algorithm, script mode in a
 managed container, or a custom container?
 *Recommendation:* script mode with a managed framework container (XGBoost or
 scikit-learn). Our code, their runtime — no image build to maintain, and no
 lock-in to a built-in algorithm's input format. Revisit if the problem turns out to
 need something the managed images do not cover.
+
+**Decided (2026-08-27):** script mode on the managed scikit-learn container, with a `LogisticRegression` pipeline. Our code, their runtime — no image to build or maintain. The model choice is close to irrelevant at this data size; the pipeline shape is the deliverable.
 
 **D-29 — Endpoint type.** Real-time (always-on instance), Serverless Inference
 (scales to zero, cold starts, CPU-only, memory-capped), or Asynchronous?
@@ -360,6 +370,8 @@ infrastructure releases.
 training runs register new versions in the Model Registry; promotion is a
 deliberate, manual step consistent with D-07. Which of the two mechanisms performs
 the swap is worth deciding explicitly rather than by accident.
+
+**Partially decided (2026-08-27):** training runs register a version in the Model Registry as `PendingManualApproval`, and `terraform apply` is not involved — a retrain is a script, not an infrastructure change. What performs the endpoint swap on approval is still open, and lands with phase 5.
 
 ### Terraform and platform
 
@@ -448,7 +460,7 @@ These block specific decisions. They are about the problem, not the technology.
 | ID | Question | Blocks |
 |---|---|---|
 | Q-01 | ~~What format does the data arrive in?~~ **Partially answered:** CSV with header, 13 columns, profiled in [docs/dataset-takehome-orders.md](./docs/dataset-takehome-orders.md). Still open: what system produces it, and how it will reach S3 in future (manual upload for now) | D-15, D-18 |
-| Q-02 | What is the ML problem — what are we predicting, from what, and is it classification or regression? | D-27, D-28 |
+| Q-02 | ~~What is the ML problem?~~ **Answered (2026-08-27):** binary classification — will an order end up refunded, from information available when it is placed. Defined in `sql/migrations/005_ml_training_view.sql` | D-27, D-28 |
 | Q-03 | Latency and throughput requirements for the endpoint — is a cold start of several seconds acceptable? | D-27, D-29 |
 | Q-04 | Who calls the endpoint? Our own AWS workloads, an internal service outside AWS, or external customers? | D-30 |
 | Q-05 | Data volume — per batch and total — and how fast is it growing? | D-21, D-22 |
@@ -479,10 +491,16 @@ Live progress against these phases is tracked in [TODO.md](./TODO.md).
 
 **Current status (2026-08-27):** Phases 0–2 are applied, but **phase 2 has never
 completed a run** — the first attempt failed at startup and the fix is not yet
-applied (T-2.12). Phase 3 is written and validated, not applied: VPC, Redshift
-Serverless, IAM, schema migrations and the load path. Phase 3 was started before
-phase 2 was verified, which departs from the rule at the top of §7; the
-dependency is real, since the load reads the Glue catalog table the ETL creates.
+applied (T-2.12). Phases 3 and 4 are written and validated but not applied:
+VPC, Redshift Serverless, schema migrations, the load path, the SageMaker
+execution role, the Model Registry group and the training workflow.
+
+Both were built ahead of the verification rule at the top of §7, and the
+dependency chain is real: the warehouse load reads the Glue catalog table the
+ETL registers, and training reads the warehouse. Nothing downstream of T-2.12
+can be exercised until the Glue job completes a run. The training script itself
+*has* been verified end to end locally, against the real sample file through the
+actual Spark transform.
 
 ---
 
@@ -513,3 +531,4 @@ dependency is real, since the load reads the Glue catalog table the ETL creates.
 | 2026-08-27 | D-12 revised: raw is flat (`<source>/<dataset>/<file>`), processed stays partitioned by `ingest_date` = the run date. Processed partitions are now full snapshots, so consumers read the newest one. `--ingest_date` defaults to `today`; `latest` now resolves against processed, to redo the most recent load. |
 | 2026-08-27 | D-32 closed: state migrated to S3 (`joseroberts87-tf-backend-etl`) with S3-native locking, no DynamoDB. Backend isolated in `backend.tf` so local state stays available for throwaway work. |
 | 2026-08-27 | Phase 3 built: VPC (3 AZs, no NAT), Redshift Serverless with a usage limit, IAM, `sql/` migrations and a Data API runner. D-22, D-24, D-25, D-37 decided; D-38's Redshift half decided; **D-23 revised** — Spectrum + `INSERT ... SELECT` instead of `COPY`, because COPY cannot populate a partition column. |
+| 2026-08-27 | Phase 4 built. **Q-02 answered** — refund-risk classification. D-26, D-27, D-28 decided; D-31 partially. Training verified end to end locally against the real sample data through the actual Spark transform. |

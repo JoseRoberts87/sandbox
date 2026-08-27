@@ -191,6 +191,19 @@ snapshot, so a direct query counts each order once per run.
 applied by `scripts/redshift_sql.sh` through the Data API, deliberately, like an
 apply.
 
+**The model artifact is one sklearn `Pipeline`, preprocessing included — do not
+split them.** That is D-27: inference cannot apply different transforms from
+training because there is a single object and a single code path. Row selection,
+the label, and the leakage exclusions live in
+`sql/migrations/005_ml_training_view.sql`, and `tests/test_train.py` asserts the
+view's SELECT list and the script's feature list still agree. If you add a
+feature, add it in both places or that test fails.
+
+**Training is a script, not a `terraform apply`.** Terraform owns the execution
+role and the Model Registry group; `scripts/train_model.sh` unloads, trains and
+registers a version as `PendingManualApproval`. Nothing deploys on its own
+(D-31).
+
 **Redshift Serverless is the only component that can run up a bill on its own.**
 Base capacity is pinned to the 8 RPU floor and a monthly usage limit is set to
 `deactivate` on breach. If queries suddenly fail, check the usage limit before

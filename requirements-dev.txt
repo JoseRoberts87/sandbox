@@ -10,3 +10,9 @@
 # specific to Spark 3.5 would not be caught here.
 pytest==9.1.1
 pyspark==4.2.0
+
+# Phase 4. ml/train.py runs unchanged on a laptop and inside the SageMaker
+# scikit-learn container, so the training logic is testable without AWS.
+scikit-learn==1.9.0
+pandas==3.0.5
+joblib==1.5.2
