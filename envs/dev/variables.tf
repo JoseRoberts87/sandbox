@@ -144,6 +144,12 @@ variable "etl_source_format" {
   }
 }
 
+variable "etl_max_reject_pct" {
+  description = "Fail a run when more than this percentage of rows are quarantined. A few bad rows should not kill a batch; a broken feed should not load silently (D-20)."
+  type        = number
+  default     = 5.0
+}
+
 variable "etl_schedule_enabled" {
   description = "Whether the ETL schedule fires. Off until cadence (Q-08) is settled and real data is landing."
   type        = bool

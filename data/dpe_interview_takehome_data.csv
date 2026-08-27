@@ -1,0 +1,21 @@
+order_id,order_ts,customer_id,region,channel,product_sku,product_name,category,quantity,unit_price_usd,discount_pct,order_status,shipping_days
+ORD-004291,2026-01-28 16:29:16,CUST-00318,North America,partner,SKU-1003,500pc Night Market,  Puzzles ,1,26.98,0.00,refunded,2
+ORD-003561,07/25/2025,CUST-01587,APAC,retail,SKU-1206,Warband Set,Miniatures,2,69.90,0.00,completed,20
+ORD-001008,12/28/2025,CUST-00710,North America,online,SKU-1380,1000pc Coastline,Puzzles,1,26.00,0.15,completed,1
+ORD-001383,12-May-2025,CUST-01130,EMEA,partner,SKU-1045,Season Pass,DIGITAL,4,8.54,0.00,cancelled,8
+ORD-004484,2026-05-24 23:10:26,CUST-00588,NORTH AMERICA,wholesale,SKU-1198,Deck Box,Accessories,1,18.88,0.00,refunded,14
+ORD-001821,2025-10-06 07:05:46,CUST-00449,North America,retail,SKU-1067,Paint Set,Miniatures,12,37.33,0.00,pending,7
+ORD-002381,2025-05-09 07:08:30,CUST-00631,EMEA,partner,SKU-1013,Booster Pack,Trading Cards,2,209.72,0.00,refunded,2
+ORD-001304,2025-05-06T07:42:56Z,CUST-00563,EMEA,WHOLESALE,SKU-1144,Season Pass,Digital,1,28.56,0.25,pending,13
+ORD-000976,2025-01-20 18:36:28,CUST-00770,EMEA,wholesale,SKU-1205,Paint Set,  Miniatures ,5,75.14,0.00,cancelled,13
+ORD-004362,12-May-2026,CUST-00786,LATAM,retail,SKU-1386,Promo Tin,Trading Cards,2,$159.28,0.00,refunded,19
+ORD-004236,2026-05-09 21:44:26,CUST-01663,LATAM,retail,SKU-1268,Card Sleeves,Accessories,2,19.34,0.00,cancelled,20
+ORD-002982,2025-02-14T20:50:14Z,CUST-01263,LATAM,wholesale,SKU-1202,Cosmetic Bundle,Digital,1,56.14,0.00,completed,18
+ORD-000283,05/18/2025,CUST-01585,North America,retail,SKU-1009,Paint Set,Miniatures,8,139.45,0.00,pending,3
+ORD-004926,2026-04-23 11:59:52,CUST-01557,LATAM,wholesale,SKU-1067,Dungeon Delve,Board Games,1,15.98,0.15,cancelled,
+ORD-001642,2025-12-17 00:47:47,CUST-00490,apac,retail,SKU-1080,Playmat,  Accessories ,8,14.04,0.15,pending,12
+ORD-002565,2025-06-05 12:47:46,CUST-01689,North America,retail,SKU-1378,Deck Box,  Accessories ,3,11.28,0.00,completed,14
+ORD-001945,2025-01-02 18:26:31,CUST-00551,North America,online,SKU-1278,Dice Set,  Accessories ,3,31.47,0.00,refunded,5
+ORD-002084,06/14/2025,CUST-00131,emea,RETAIL,SKU-1385,2000pc Star Chart,Puzzles,1,17.55,0.00,cancelled,14
+ORD-001572,27-Apr-2026,CUST-00106,North America,retail,SKU-1295,Bundle Case,Trading Cards,1,12.04,0.20,refunded,9
+

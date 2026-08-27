@@ -57,14 +57,30 @@ accident.
 
 ## Commands
 
-The gate is pre-commit, and it needs no AWS credentials:
+Two gates, neither needing AWS credentials:
 
 ```bash
-pre-commit run --all-files --verbose      # fmt, validate, tflint, checkov
-python3 -m py_compile glue/jobs/*.py      # not covered by the hooks
+pre-commit run --all-files --verbose      # terraform: fmt, validate, tflint, checkov
+venv/bin/python -m pytest                 # 96 tests
+venv/bin/python -m pytest -m "not spark"  # 65 of them, no JVM, ~0.1s
 ```
 
-There is no test suite. Individual pieces, if you want them directly:
+Tests live in `tests/`, run against the venv in `venv/` (see
+`requirements-dev.txt`). `conftest.py` stubs `awsglue` and `boto3` so the real
+job module can be imported locally; tests call `evaluate_rows` and
+`select_clean` directly, so they exercise deployed code rather than a copy.
+Spark tests are marked `spark` and skip when no JVM is present.
+
+**`configure_session()` in the job is load-bearing — do not remove it.** It sets
+`spark.sql.ansi.enabled=false` and pins the session timezone to UTC. Under ANSI
+mode a failed cast or unparseable timestamp *throws*, which would abort a whole
+batch on one bad row and break the quarantine design entirely; multi-format
+timestamp parsing also relies on coalescing across formats where all but one
+branch fails by design. Glue 5.0 (Spark 3.5) defaults ANSI off and Spark 4
+defaults it on, so it is set explicitly instead of inherited. The timezone pin
+keeps `ingest_date` bucketing and derived `order_date` from shifting a day.
+
+Individual terraform pieces, if you want them directly:
 
 ```bash
 terraform fmt -recursive -check           # from repo root

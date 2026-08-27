@@ -3,9 +3,22 @@ repos:
     rev: v1.105.0
     hooks:
       - id: terraform_fmt
-
       - id: terraform_validate
-
       - id: terraform_tflint
-      
       - id: terraform_checkov
+        args:
+          - --args=--quiet
+          - --args=--skip-path=venv
+          - --args=--skip-path=.terraform
+
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest (non-Spark)
+        entry: pytest
+        language: system
+        pass_filenames: false
+        types: [python]
+        args:
+          - -m
+          - "not spark"

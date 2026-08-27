@@ -238,7 +238,13 @@ land in CloudWatch. Needs a policy decision: does a failed rule **stop** the loa
 Proposal: fail closed on schema/uniqueness/null-key violations, warn on
 distribution drift.
 
-**Partially decided (2026-08-26):** the job fails closed on an empty partition and on missing required columns (`--required_columns`). Formal Glue Data Quality rulesets need a catalog table to target, so they land with T-2.10 once the schema is declared.
+**Extended (2026-08-26).** Three tiers, not one:
+
+- **Structural problems fail the run immediately** — a missing column, an unreadable path, an empty partition. These mean the file is not what we think it is, and loading any of it would be wrong.
+- **Row-level problems are quarantined, not dropped.** A row that fails to parse or violates a constraint is written to `_rejected/<source>/<dataset>/ingest_date=.../` with its original values and a `reject_reason`. Silently nulling a bad value is the failure mode this exists to prevent.
+- **The run fails if the reject rate exceeds `--max_reject_pct` (default 5%).** A few bad rows should not kill a batch; a feed that has broken should not load quietly. Rejects are written before the threshold is evaluated, so a failed run still leaves the evidence.
+
+Formal Glue Data Quality rulesets still need a catalog table to target — T-2.17.
 
 **D-21 — Language and structure of job code.** PySpark scripts in the repo,
 uploaded to the scripts bucket. Glue Studio's visual editor produces code we
@@ -394,7 +400,7 @@ These block specific decisions. They are about the problem, not the technology.
 
 | ID | Question | Blocks |
 |---|---|---|
-| Q-01 | What is the data source, what format does it arrive in, and how does it get to S3? | D-15, D-18 |
+| Q-01 | ~~What format does the data arrive in?~~ **Partially answered:** CSV with header, 13 columns, profiled in [docs/dataset-takehome-orders.md](./docs/dataset-takehome-orders.md). Still open: what system produces it, and how it will reach S3 in future (manual upload for now) | D-15, D-18 |
 | Q-02 | What is the ML problem — what are we predicting, from what, and is it classification or regression? | D-27, D-28 |
 | Q-03 | Latency and throughput requirements for the endpoint — is a cold start of several seconds acceptable? | D-27, D-29 |
 | Q-04 | Who calls the endpoint? Our own AWS workloads, an internal service outside AWS, or external customers? | D-30 |
@@ -454,3 +460,5 @@ state.
 | 2026-08-25 | Added `TODO.md` — phase-by-phase task tracker keyed to these decisions. |
 | 2026-08-26 | Phase 2 (ETL) built. D-11, D-12, D-17, D-18, D-21, D-38 decided; D-16 and D-20 partially decided pending schema; **D-19 revised** — bookmarks off, in favour of date-addressed idempotent partition rewrites. |
 | 2026-08-26 | `pre-commit` added (fmt, validate, tflint, checkov). Two real findings fixed — Glue security configuration and a CMK on the ETL schedule. Two documented skips: one verified false positive, one deferred to T-6.6. |
+| 2026-08-26 | Real dataset arrived. `takehome/orders` schema and cleaning rules declared in the job; `inferSchema` demoted to a fallback. D-20 extended: row-level failures are quarantined to `_rejected/` with a reason and a reject-rate threshold, rather than failing the batch. Q-01 partially answered. |
+| 2026-08-26 | pytest suite added (96 tests). It caught two implicit runtime dependencies in the job: ANSI mode (a failed cast throws rather than nulling, which would abort a batch and defeat quarantine entirely) and session timezone (date bucketing able to shift a day). Both are now set explicitly in `configure_session()`. |

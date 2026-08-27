@@ -216,6 +216,13 @@ data "aws_iam_policy_document" "glue_crawler" {
   }
 
   statement {
+    sid       = "ReadGlueSecurityConfiguration"
+    effect    = "Allow"
+    actions   = ["glue:GetSecurityConfiguration"]
+    resources = ["*"]
+  }
+
+  statement {
     sid       = "Logs"
     effect    = "Allow"
     actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
