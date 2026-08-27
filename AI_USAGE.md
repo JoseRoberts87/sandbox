@@ -790,3 +790,69 @@ script downloaded from the artifacts bucket reported
 blocking the run, but it contradicts a documented decision and should be checked.
 The job still needs `terraform apply` before the next attempt — this fix changes
 the script, and the IAM statement from entry 010 is still pending.
+
+---
+
+### 013 — Remote state in S3, with local state still available
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `envs/dev/backend.tf` (new), `envs/dev/versions.tf`, `.gitignore`, `README.md`, `CLAUDE.md`, `PROJECT_SCOPE.md`, `TODO.md`
+
+**Prompt**
+
+```text
+lets migrate the state to s3 using this bucket joseroberts87-tf-backend-etl and make sure to include instructions on the readme on how to use either a local state or a remote state
+```
+
+**Output**
+
+Configured the S3 backend and documented both modes. **Did not run
+`terraform init -migrate-state`** — it is a state operation at least as
+consequential as an apply, and D-07 keeps Terraform runs with a developer. The
+README carries the exact sequence.
+
+**`envs/dev/backend.tf`** — the backend in a file of its own rather than inside
+`versions.tf`. Switching between remote and local then means renaming a file
+instead of commenting out lines inside a block, which is the version of this
+that goes wrong at 2am. Removed the stale commented-out block from
+`versions.tf`.
+
+```
+bucket  joseroberts87-tf-backend-etl
+key     envs/dev/terraform.tfstate
+lock    use_lockfile — S3-native conditional writes, no DynamoDB table
+```
+
+The Terraform upgrade from T-0.10 pays off here: `use_lockfile` needs >= 1.10, so
+there is no lock table to create now and remove later.
+
+**README gained a `State` section** covering: the backend settings; that the
+state bucket is deliberately outside Terraform's ownership (it cannot hold the
+state describing itself) and **must have versioning enabled**, being the only
+recovery path from a corrupted write; the one-time migration with a backup step
+first and a `terraform state list` + `terraform plan` verification before
+deleting anything local; how to switch to local state and back; and when each is
+appropriate.
+
+The migration sequence deliberately backs up local state *before* migrating and
+only removes it *after* a clean plan, with an explicit "if this looks wrong,
+stop and restore" instruction. The failure mode being guarded against is a
+migration that silently lands in the wrong bucket or key and leaves Terraform
+believing the infrastructure does not exist.
+
+Added `backend.tf.disabled` to `.gitignore` — running against local state is a
+per-working-copy choice, not a repo-wide one. Updated the state claims in
+`CLAUDE.md`, closed D-32 in the scope with the reasoning, and marked T-2.9 done
+while noting the migration command itself is still outstanding.
+
+**Verification run:** all five pre-commit hooks pass. `terraform validate` still
+works with an uninitialised backend because the hook runs `init -backend=false`.
+
+**Notes**
+
+Accepted as-is. Two things assumed and worth confirming: the bucket is in
+`us-east-1` (it must match `region` in `backend.tf`, or init fails), and it
+already has versioning enabled. Nothing was verified against AWS, per the
+standing instruction.

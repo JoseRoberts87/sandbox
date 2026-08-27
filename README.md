@@ -37,8 +37,8 @@ of them.
 - **Commits are manual.**
 - Components are built **one at a time**, in the phase order defined in the
   project scope. Each phase is applied and verified before the next begins.
-- **State is local for now** (`envs/dev/terraform.tfstate`, gitignored) and must
-  migrate to an S3 backend before Redshift lands — see D-32 and T-2.9.
+- **State lives in S3** (`joseroberts87-tf-backend-etl`), with S3-native locking.
+  Running against local state is still supported — see [State](#state).
 
 ## Requirements
 
@@ -57,6 +57,84 @@ cd sandbox
 aws sso login --profile <your-profile>     # or export AWS_PROFILE / access keys
 aws sts get-caller-identity                # confirm the target account
 ```
+
+## State
+
+Terraform state is held remotely by default:
+
+| | |
+|---|---|
+| Bucket | `joseroberts87-tf-backend-etl` |
+| Key | `envs/dev/terraform.tfstate` |
+| Region | `us-east-1` |
+| Locking | S3-native conditional writes (`use_lockfile`) — no DynamoDB table |
+| Encryption | `encrypt = true` |
+
+The backend is declared in `envs/dev/backend.tf`, deliberately in its own file so
+switching modes is a file-level toggle rather than an edit inside a block.
+
+The state bucket is **not managed by this configuration** — it cannot be, since
+it would hold the state describing itself. Create it once by hand, and make sure
+it has **versioning enabled**: that is the only thing between a corrupted apply
+and an unrecoverable environment. Block public access and enable encryption too.
+
+### Using remote state (default)
+
+```bash
+cd envs/dev
+terraform init        # first time on a machine, or after changing the backend
+terraform plan
+```
+
+### Migrating local state to S3 (one time)
+
+```bash
+cd envs/dev
+
+# 1. Keep a copy. If the migration goes wrong this file is the way back.
+cp terraform.tfstate "terraform.tfstate.backup-$(date -u +%Y%m%dT%H%M%SZ)"
+
+# 2. Terraform detects the new backend and offers to copy existing state up.
+#    Answer "yes" at the prompt.
+terraform init -migrate-state
+
+# 3. Verify before trusting it: same resources, and nothing to change.
+terraform state list
+terraform plan        # expect "No changes"
+
+# 4. Only then remove the local copies.
+rm -f terraform.tfstate terraform.tfstate.backup
+```
+
+If step 3 shows resources missing or a plan that wants to recreate things,
+**stop** — restore the backup from step 1 and re-check the bucket, key and region
+before trying again.
+
+### Using local state instead
+
+```bash
+cd envs/dev
+mv backend.tf backend.tf.disabled
+terraform init -migrate-state     # pulls state down into ./terraform.tfstate
+```
+
+To go back:
+
+```bash
+mv backend.tf.disabled backend.tf
+terraform init -migrate-state
+```
+
+`backend.tf.disabled` is gitignored, and `*.tfstate` never gets committed in
+either mode.
+
+### Which to use
+
+Remote for anything shared or real: it survives a lost laptop, it locks so two
+applies cannot race, and it is versioned. Local only for a throwaway environment
+you are willing to lose — with local state, `envs/dev/terraform.tfstate` is the
+single copy of the record of what exists, and applying from a second machine will
+silently diverge.
 
 ## Usage
 
@@ -182,8 +260,8 @@ cd envs/dev
 terraform destroy
 ```
 
-Because state is local, `terraform.tfstate` in `envs/dev/` is the **only** record
-of what exists. Do not delete it, and do not run applies from two machines.
+With remote state, `terraform destroy` is still irreversible for the data in the
+buckets — emptying them is a separate, deliberate act.
 
 ## Tests
 
@@ -221,7 +299,8 @@ venv/bin/python -m pip install -r requirements-dev.txt
 ├── data/                   # sample source data
 ├── scripts/                # land_sample_data.sh
 ├── envs/
-│   └── dev/                # dev environment root module (local state)
+│   └── dev/                # dev environment root module
+│       ├── backend.tf      # remote state; remove this file to go local
 │       ├── main.tf         # locals
 │       ├── kms.tf          # data lake encryption key
 │       ├── storage.tf      # raw / processed / artifacts buckets

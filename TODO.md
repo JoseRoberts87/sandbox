@@ -84,7 +84,7 @@ its turn comes, not before.
 - [ ] **T-2.10** Declare the processed table in Terraform and set `--update_catalog=false` (D-16). The explicit read schema half is **done** — `takehome/orders` declares its types in the job; `inferSchema` is now only a fallback for unspec'd datasets. Do the Terraform half after T-2.12 confirms the written schema
 - [ ] **T-2.18** Decide whether processed should partition on `order_date` instead of `ingest_date` (D-12). Snapshot partitions repeat the whole dataset per run; settle before the phase 3 COPY, since it changes what Redshift reads
 - [ ] **T-2.16** Confirm the two assumptions in `docs/dataset-takehome-orders.md` with whoever owns the source: month-first slash dates, and the `net_amount_usd` definition
-- [ ] **T-2.9** ⚠️ **Migrate state to S3 before Phase 3 starts** — state must not be local once Redshift exists (D-32)
+- [x] **T-2.9** Remote state configured: `joseroberts87-tf-backend-etl`, S3-native locking, no DynamoDB (D-32). **`terraform init -migrate-state` still has to be run** — see the README's State section
 
 ## Phase 3 — Warehouse *(to expand)*
 
