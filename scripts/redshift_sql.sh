@@ -47,8 +47,18 @@ done
 if [[ -d "$TARGET" ]]; then
   mapfile -t FILES < <(find "$TARGET" -maxdepth 1 -name '*.sql' | sort)
 else
+  [[ -f "$TARGET" ]] || { echo "error: $TARGET not found" >&2; exit 1; }
   FILES=("$TARGET")
 fi
+
+# An empty match must not look like success. Without this, pointing the script
+# at a directory holding no .sql files prints "done" having applied nothing.
+if [[ ${#FILES[@]} -eq 0 ]]; then
+  echo "error: no .sql files found in $TARGET" >&2
+  exit 1
+fi
+
+echo "applying ${#FILES[@]} file(s) to $DATABASE on $WORKGROUP"
 
 PAYLOAD=$(mktemp)
 trap 'rm -f "$PAYLOAD"' EXIT
@@ -109,4 +119,4 @@ PY
   done
 done
 
-echo "done"
+echo "applied ${#FILES[@]} file(s)"

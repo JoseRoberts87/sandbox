@@ -8,5 +8,12 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 6.61"
     }
+
+    # Zips the Lambda source at plan time, so the deployed function always
+    # matches the committed handler.
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.7"
+    }
   }
 }

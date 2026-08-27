@@ -243,3 +243,83 @@ variable "sagemaker_max_runtime_seconds" {
   type        = number
   default     = 900
 }
+
+# -------------------------------- inference -----------------------------------
+
+variable "approved_model_package_arn" {
+  description = "ARN of the approved Model Registry version to serve. **Empty means no inference stack is created at all** — endpoint, Lambda and API Gateway are all gated on this. Setting it is the promotion step (D-31): approve a version, paste its ARN here, apply."
+  type        = string
+  default     = ""
+}
+
+variable "endpoint_memory_mb" {
+  description = "Serverless Inference memory. Must be one of 1024/2048/3072/4096/5120/6144. 2048 is comfortable for an sklearn pipeline."
+  type        = number
+  default     = 2048
+
+  validation {
+    condition     = contains([1024, 2048, 3072, 4096, 5120, 6144], var.endpoint_memory_mb)
+    error_message = "Serverless Inference memory must be 1024, 2048, 3072, 4096, 5120 or 6144 MB."
+  }
+}
+
+variable "endpoint_max_concurrency" {
+  description = "Concurrent invocations the serverless endpoint will scale to. Low on purpose — it is a cost ceiling as much as a capacity setting."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.endpoint_max_concurrency >= 1 && var.endpoint_max_concurrency <= 200
+    error_message = "Max concurrency must be between 1 and 200."
+  }
+}
+
+# ----------------------------------- api --------------------------------------
+
+variable "predict_lambda_timeout_seconds" {
+  description = "Lambda timeout. Generous relative to a warm call, because a serverless endpoint cold start can take several seconds."
+  type        = number
+  default     = 30
+}
+
+variable "predict_lambda_reserved_concurrency" {
+  description = "Reserved concurrency for the proxy. Caps blast radius: a burst here cannot starve the rest of the account."
+  type        = number
+  default     = 10
+}
+
+variable "predict_max_instances" {
+  description = "Maximum rows accepted in one prediction request."
+  type        = number
+  default     = 100
+}
+
+variable "api_throttle_rate_limit" {
+  description = "Steady-state requests per second allowed per API key."
+  type        = number
+  default     = 10
+}
+
+variable "api_throttle_burst_limit" {
+  description = "Burst capacity above the steady rate."
+  type        = number
+  default     = 20
+}
+
+variable "api_daily_quota" {
+  description = "Requests per key per day. The endpoint scales with demand, so an unmetered key is an unmetered bill."
+  type        = number
+  default     = 10000
+}
+
+variable "log_retention_days" {
+  description = "Retention for log groups this configuration declares. The AWS default is never expire, which quietly accrues cost (D-40)."
+  type        = number
+  default     = 30
+}
+
+variable "endpoint_network_isolation" {
+  description = "Cut the inference container off from the network. Correct for this model, which scores in memory. Set false only while diagnosing an endpoint that will not reach InService."
+  type        = bool
+  default     = true
+}

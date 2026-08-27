@@ -51,3 +51,20 @@ redshift_max_capacity         = 32
 redshift_monthly_rpu_hours    = 40
 redshift_usage_breach_action  = "deactivate"
 redshift_enhanced_vpc_routing = true
+
+# --- inference (phase 5) ---
+# Empty until a model version is approved. Setting this ARN is the promotion
+# step (D-31) and creates the endpoint, the Lambda proxy and the public API;
+# clearing it removes them. scripts/promote_model.sh prints the line to paste.
+approved_model_package_arn = ""
+
+endpoint_memory_mb       = 2048
+endpoint_max_concurrency = 5
+
+# External consumers (Q-04): the API key is the credential, the usage plan is
+# the meter.
+api_throttle_rate_limit  = 10
+api_throttle_burst_limit = 20
+api_daily_quota          = 10000
+
+log_retention_days = 30

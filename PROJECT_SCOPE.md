@@ -353,6 +353,8 @@ need something the managed images do not cover.
 switch to provisioned real-time if a latency SLO makes cold starts unacceptable.
 **Depends on Q-03.**
 
+**Decided (2026-08-27):** Serverless Inference, 2048 MB, max concurrency 5. It scales to zero, so an idle environment costs nothing — the deciding factor, since a provisioned real-time endpoint would have become the largest standing cost in the project while serving no traffic. The trade is a cold start of several seconds after inactivity; the Lambda proxy translates that into a `503 model endpoint is warming up, please retry` rather than an opaque 500.
+
 **D-30 — Endpoint exposure and auth.** A SageMaker endpoint is not publicly
 callable — every request must be SigV4-signed with IAM credentials. So: do
 consumers assume an IAM role and call `InvokeEndpoint` directly, or do we front it
@@ -361,6 +363,12 @@ shaping?
 *Recommendation:* if consumers are AWS workloads in our account, direct IAM invoke
 — fewer moving parts. If anything outside the account calls it, API Gateway.
 **Depends on Q-04.**
+
+**Decided (2026-08-27): API Gateway.** Consumers are outside AWS (Q-04), and a SageMaker endpoint cannot be called from outside AWS at all — every request must be SigV4-signed. So the endpoint gets a front door: API Gateway REST (not HTTP API, which has no native API keys) holds the key, the throttle and a daily quota; a Lambda holds the IAM identity that can actually invoke, scoped to `sagemaker:InvokeEndpoint` on that one endpoint.
+
+The quota matters more than it looks: the endpoint scales with demand, so an unmetered key is an unmetered bill.
+
+The proxy returns 400 for input the caller can fix — including passing through the model's own "missing required fields" message — and 502 with no detail for anything internal. An external caller should never learn a role ARN from an error.
 
 **D-31 — Retraining and promotion.** Terraform pinning the endpoint to a specific
 model artifact means every retrain is a `terraform apply` — which keeps the
@@ -372,6 +380,17 @@ deliberate, manual step consistent with D-07. Which of the two mechanisms perfor
 the swap is worth deciding explicitly rather than by accident.
 
 **Partially decided (2026-08-27):** training runs register a version in the Model Registry as `PendingManualApproval`, and `terraform apply` is not involved — a retrain is a script, not an infrastructure change. What performs the endpoint swap on approval is still open, and lands with phase 5.
+
+**Decided (2026-08-27).** Two separate acts:
+
+1. **Approve** — `scripts/promote_model.sh` marks a registry version fit to serve. This deploys nothing.
+2. **Serve** — set `approved_model_package_arn` in `terraform.tfvars` and apply.
+
+So the deployed model version lives in version control and changes only through a reviewed diff, which is what D-07 asks for. A retrain never needs an apply; a *promotion* deliberately does.
+
+The whole inference stack is gated on that variable: empty means no endpoint, no Lambda, no API. That keeps phase 5 appliable before phase 4 has produced anything.
+
+**Known consequence, and wrong for prod:** because the front door is gated on the same variable, clearing it destroys the API key and URL along with the endpoint. Fine while there are no consumers; for prod the front door must be decoupled so the URL and key stay stable across model changes. Tracked as T-5.9.
 
 ### Terraform and platform
 
@@ -461,8 +480,8 @@ These block specific decisions. They are about the problem, not the technology.
 |---|---|---|
 | Q-01 | ~~What format does the data arrive in?~~ **Partially answered:** CSV with header, 13 columns, profiled in [docs/dataset-takehome-orders.md](./docs/dataset-takehome-orders.md). Still open: what system produces it, and how it will reach S3 in future (manual upload for now) | D-15, D-18 |
 | Q-02 | ~~What is the ML problem?~~ **Answered (2026-08-27):** binary classification — will an order end up refunded, from information available when it is placed. Defined in `sql/migrations/005_ml_training_view.sql` | D-27, D-28 |
-| Q-03 | Latency and throughput requirements for the endpoint — is a cold start of several seconds acceptable? | D-27, D-29 |
-| Q-04 | Who calls the endpoint? Our own AWS workloads, an internal service outside AWS, or external customers? | D-30 |
+| Q-03 | ~~Latency requirements?~~ **Answered (2026-08-27):** a cold start of several seconds is acceptable, so Serverless Inference | D-27, D-29 |
+| Q-04 | ~~Who calls the endpoint?~~ **Answered (2026-08-27):** consumers outside AWS, so API Gateway with an API key and quota | D-30 |
 | Q-05 | Data volume — per batch and total — and how fast is it growing? | D-21, D-22 |
 | Q-06 | Which AWS account and region, and is prod a separate account? | D-35, D-37 |
 | Q-07 | Monthly budget ceiling. | D-39 |
@@ -489,18 +508,21 @@ starts before the previous phase is applied and verified.
 Detailed task breakdowns for each phase come later, one phase at a time.
 Live progress against these phases is tracked in [TODO.md](./TODO.md).
 
-**Current status (2026-08-27):** Phases 0–2 are applied, but **phase 2 has never
-completed a run** — the first attempt failed at startup and the fix is not yet
-applied (T-2.12). Phases 3 and 4 are written and validated but not applied:
-VPC, Redshift Serverless, schema migrations, the load path, the SageMaker
-execution role, the Model Registry group and the training workflow.
+**Current status (2026-08-27):** All infrastructure through phase 5 is applied.
 
-Both were built ahead of the verification rule at the top of §7, and the
-dependency chain is real: the warehouse load reads the Glue catalog table the
-ETL registers, and training reads the warehouse. Nothing downstream of T-2.12
-can be exercised until the Glue job completes a run. The training script itself
-*has* been verified end to end locally, against the real sample file through the
-actual Spark transform.
+The data path is proven as far as the **processed zone**: the Glue job runs and
+is idempotent on rerun (T-2.14). The warehouse itself is empty — querying it on
+2026-08-27 returned `schema "analytics" does not exist`, so the migrations
+(T-3.7) never applied and no snapshot has been loaded (T-3.8). Both were
+reopened. `terraform apply` does not run migrations by design (D-38); they are a
+separate deliberate step and were missed.
+
+Everything from the warehouse onward is therefore unexercised. The inference
+stack is deliberately absent while `approved_model_package_arn` is empty.
+
+Still unverified: that a repeated load does not double rows (T-3.9), and that
+`analytics.orders` returns only the newest snapshot (T-3.10). Both are
+properties the design depends on rather than incidental details.
 
 ---
 
@@ -532,3 +554,4 @@ actual Spark transform.
 | 2026-08-27 | D-32 closed: state migrated to S3 (`joseroberts87-tf-backend-etl`) with S3-native locking, no DynamoDB. Backend isolated in `backend.tf` so local state stays available for throwaway work. |
 | 2026-08-27 | Phase 3 built: VPC (3 AZs, no NAT), Redshift Serverless with a usage limit, IAM, `sql/` migrations and a Data API runner. D-22, D-24, D-25, D-37 decided; D-38's Redshift half decided; **D-23 revised** — Spectrum + `INSERT ... SELECT` instead of `COPY`, because COPY cannot populate a partition column. |
 | 2026-08-27 | Phase 4 built. **Q-02 answered** — refund-risk classification. D-26, D-27, D-28 decided; D-31 partially. Training verified end to end locally against the real sample data through the actual Spark transform. |
+| 2026-08-27 | Phase 5 built. **Q-03 and Q-04 answered**; D-29, D-30, D-31 decided. Serverless endpoint behind API Gateway + a Lambda proxy, all gated on an approved model version. A CloudWatch Logs KMS key was added, which is the hard half of T-6.6. |
