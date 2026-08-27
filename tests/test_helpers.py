@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from conftest import GlueArgumentError
+from conftest import GlueArgumentConflictError, GlueArgumentError
 
 
 class TestNormalize:
@@ -143,7 +143,7 @@ class TestResolveArgs:
         monkeypatch.setattr(job.sys, "argv", _argv())
         args = job.resolve_args()
         assert args["source_format"] == "csv"
-        assert args["ingest_date"] == "latest"
+        assert args["ingest_date"] == "today"
         assert args["max_reject_pct"] == "5.0"
         assert args["csv_infer_schema"] == "false"
 
@@ -157,6 +157,37 @@ class TestResolveArgs:
         # Terraform can pass an empty string for an unset argument.
         monkeypatch.setattr(job.sys, "argv", _argv(source_format=""))
         assert job.resolve_args()["source_format"] == "csv"
+
+    def test_job_run_id_in_argv_does_not_break_resolution(self, job, monkeypatch):
+        """Regression: Glue always passes --JOB_RUN_ID, and asking
+        getResolvedOptions to resolve it raises `conflicting option string`,
+        which killed the run before main() did anything."""
+        monkeypatch.setattr(job.sys, "argv", _argv(JOB_RUN_ID="jr_abc123", JOB_ID="j_xyz"))
+        args = job.resolve_args()
+        assert args["JOB_RUN_ID"] == "jr_abc123"
+
+    def test_reserved_arguments_are_never_requested(self, job):
+        # Requesting one of these from getResolvedOptions is the bug above.
+        for name in job.RESERVED_ARGS:
+            assert name not in job.OPTIONAL_ARGS
+            assert name not in job.REQUIRED_ARGS
+
+    def test_requesting_a_reserved_argument_would_conflict(self, job, monkeypatch):
+        # Pins the awsglue behaviour the fix works around.
+        argv = _argv(JOB_RUN_ID="jr_abc123")
+        with pytest.raises(GlueArgumentConflictError):
+            job.getResolvedOptions(argv, ["JOB_RUN_ID"])
+
+    def test_job_run_id_falls_back_when_absent(self, job, monkeypatch):
+        monkeypatch.setattr(job.sys, "argv", _argv())
+        assert job.resolve_args()["JOB_RUN_ID"] == "unknown"
+
+    def test_argv_value_reads_a_flag_directly(self, job, monkeypatch):
+        monkeypatch.setattr(job.sys, "argv", ["x", "--foo", "bar", "--empty", "", "--flagonly"])
+        assert job.argv_value("foo") == "bar"
+        assert job.argv_value("empty") == ""
+        assert job.argv_value("flagonly", "fallback") == "fallback"
+        assert job.argv_value("absent", "fallback") == "fallback"
 
     def test_missing_required_argument_is_an_error(self, job, monkeypatch):
         argv = _argv()

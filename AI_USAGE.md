@@ -600,3 +600,193 @@ than the Spark 3.5 that Glue 5.0 runs — the stricter runtime is what surfaced 
 ANSI dependency. The divergence is real, though: a bug specific to Spark 3.5
 would not be caught here, tracked as T-X.7. The Glue job itself still has never
 executed against AWS (T-2.12).
+
+---
+
+### 010 — Path plumbing for an end-to-end Glue run
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `envs/dev/iam.tf`, `scripts/land_sample_data.sh` (new), `.pre-commit-config.yaml`, `README.md`, `docs/dataset-takehome-orders.md`, `CLAUDE.md`, `TODO.md`
+
+**Prompt**
+
+```text
+i had to fix an issue with the policy, make sure you dont revert that. lets also make sure this path `<source>/<dataset>/ingest_date=YYYY-MM-DD/` is added in all the places it needs to be added so that i can test the glue job
+```
+
+Mid-turn: `stop checking for credentials for aws`
+
+**Output**
+
+Located the user's fix first: a `ReadGlueSecurityConfiguration` statement
+(`glue:GetSecurityConfiguration` on `*`) added to the **crawler** role in
+`aa154c5`, needed because the crawler has a security configuration attached. Left
+it untouched and verified afterwards that the diff was purely additive
+(9 insertions, no deletions).
+
+**Found the same gap on the job role.** The Glue job carries the same security
+configuration but its policy had no such statement, so it would hit the identical
+denial on first run. Added the matching statement.
+
+**Path audit.** Traced every place the layout is constructed or referenced. The
+job derives its paths from `--source_name`/`--dataset` and `terraform.tfvars`
+already points at `takehome/orders`, so the pipeline itself was correct — but the
+README's landing example still used an invented `acme_crm/customers` path, which
+is what someone following the docs would actually type.
+
+- Added **`scripts/land_sample_data.sh`** — resolves the bucket from terraform
+  outputs, defaults to today's UTC date, validates the date format, and lands the
+  file at `takehome/orders/ingest_date=YYYY-MM-DD/`, then prints the command to
+  run the job over that partition.
+- Rewrote the README's landing section around the real dataset and added a
+  **step-by-step end-to-end test sequence** (apply → land → run → watch → verify
+  the partition → verify the catalog table), including the note that Athena
+  verification would need a workgroup and results bucket that do not exist yet,
+  so the check uses `aws glue get-table` instead.
+- Cross-referenced the prefix-must-match-tfvars constraint in `CLAUDE.md` and the
+  dataset doc.
+
+**Fixed the failing pre-commit hook.** The user had added a `pytest (non-Spark)`
+hook; it failed with 65 collection errors. Cause: `entry: pytest` with
+`language: system` resolved to `/Users/jrob/miniconda3/bin/pytest`, which has no
+pyspark — and the job module imports pyspark at import time, so even the
+non-Spark tests need it. Changed the entry to `venv/bin/python -m pytest`.
+
+**Verification run:** `pre-commit run --all-files` — all **five** hooks pass
+(the four terraform hooks plus pytest). Full suite: 96 passed.
+
+Also confirmed **without contacting AWS** that the deployed job script is current,
+by comparing the `source_hash` recorded in local terraform state against an MD5
+of the working file — they match, so `apply` will not replace the script and the
+only pending change is the IAM statement.
+
+**Notes**
+
+Accepted as-is. Per the mid-turn instruction, stopped probing AWS credentials;
+the remaining verification was done against local state and files. The Glue job
+still has not executed — T-1.10 and T-2.12 are the next steps and need the apply
+first, since the job would otherwise be denied `GetSecurityConfiguration`.
+
+---
+
+### 011 — Flatten the raw path
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `glue/jobs/raw_to_processed.py`, `scripts/land_sample_data.sh`, `envs/dev/glue.tf`, `tests/test_helpers.py`, `docs/data-layout.md`, `docs/dataset-takehome-orders.md`, `README.md`, `CLAUDE.md`, `PROJECT_SCOPE.md`, `TODO.md`
+
+**Prompt**
+
+```text
+update the file path to just takehome/orders/
+```
+
+**Output**
+
+Asked one clarifying question first, because the change reaches past the landing
+script: the job addresses runs *by* the `ingest_date` partition, and that is what
+makes reruns idempotent. Offered three scopes — raw only, raw flat with processed
+partitioned on `order_date` instead, or drop partitioning entirely. **Answer: raw
+only.**
+
+Implemented:
+
+- **Raw is now flat** — `<source>/<dataset>/<file>`. A run reads every file under
+  the dataset prefix.
+- **Processed keeps `ingest_date`**, now explicitly the date of the *run* rather
+  than a property of the data.
+- `--ingest_date` **defaults to `today`** (was `latest`). `latest` was resolving
+  against raw, which no longer has partitions to discover; it now resolves
+  against *processed* and means "redo the most recent load in place", which keeps
+  `latest_partition()` useful and its four tests meaningful.
+- `scripts/land_sample_data.sh` no longer takes a date and lands at
+  `takehome/orders/<file>`.
+
+**The consequence worth stating,** flagged before implementing and now documented
+in four places: because each run reprocesses the whole of raw, every processed
+partition is a *complete snapshot*, not an increment. Consumers must read the
+newest partition — summing across partitions counts every row once per run.
+Rerunning a date still purges and rewrites it, so idempotency is unaffected.
+
+Updated D-12 in the scope with the revision, the reasoning (partitioning raw by
+arrival date added a path segment carrying no information, since every partition
+held the same single file), and the two things it leaves open: raw should be
+partitioned again if a real feed delivers dated drops (Q-01), and processed may
+be better partitioned on the derived `order_date` — added as **T-2.18**, to be
+settled before the phase 3 COPY since it changes what Redshift reads.
+
+**Verification run:** 96 tests pass (`test_applies_defaults_for_omitted_options`
+updated for the new default), all five pre-commit hooks pass, and a repo-wide
+grep confirms no stale `raw/...ingest_date=` paths remain in scripts or
+Terraform.
+
+**Notes**
+
+Accepted as-is. Per the standing instruction, no AWS calls were made. The job
+still has not executed; `terraform apply` is needed first for the pending IAM
+statement, and the job argument default changed, so apply also updates the job
+definition.
+
+---
+
+### 012 — First real run: `--JOB_RUN_ID` conflict
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `glue/jobs/raw_to_processed.py`, `tests/conftest.py`, `tests/test_helpers.py`, `envs/dev/glue.tf`, `CLAUDE.md`, `TODO.md`
+
+**Prompt**
+
+```text
+while running the job we got this log [full Glue driver log, ending in]
+argparse.ArgumentError: argument --JOB_RUN_ID: conflicting option string: --JOB_RUN_ID
+```
+
+**Output**
+
+The job failed at startup, in `resolve_args()`, before `main()` did any work.
+
+**Cause.** `awsglue.utils.getResolvedOptions` builds an argparse parser and
+pre-registers the reserved arguments — `JOB_NAME`, `JOB_ID`, `JOB_RUN_ID` —
+whenever they appear in argv, special-casing only `JOB_NAME`. `JOB_RUN_ID` was
+in `OPTIONAL_ARGS`, so the second `getResolvedOptions` call asked argparse to add
+an option it already had. Glue always passes `--JOB_RUN_ID`, so this could never
+have worked; the first successful call was the one that did not request it.
+
+**Fix.** Introduced `RESERVED_ARGS = ("JOB_ID", "JOB_RUN_ID")`, removed them from
+`OPTIONAL_ARGS`, and added `argv_value()` to read them straight from argv, with a
+fallback so the `etl_job_run_id` lineage column is never null.
+
+**The more important fix was to the test stub.** The suite had 96 passing tests
+over a job that could not start, because `conftest.py`'s `getResolvedOptions`
+stub resolved whatever it was asked for and never modelled the reserved-argument
+conflict. Updated it to pre-register the reserved names and raise
+`GlueArgumentConflictError` on a conflicting request, then added five tests: one
+reproducing Glue's real argv, one pinning the awsglue behaviour being worked
+around, one asserting reserved names never appear in `REQUIRED_ARGS` or
+`OPTIONAL_ARGS`, plus fallback and `argv_value` coverage.
+
+**Verified the regression test actually catches it** by reintroducing the bug in
+a scripted round-trip: with `JOB_RUN_ID` back in `OPTIONAL_ARGS` the suite fails
+with `GlueArgumentConflictError`; restored, it passes. A green suite that never
+fails on the bug it claims to cover is worth nothing.
+
+Also removed `--required_columns = ""` from the Terraform job arguments. The job
+defaults it anyway, and an empty-valued argument on the command line is a
+needless argparse risk — it sat immediately after the argument that failed, so
+whether it parses was never actually established.
+
+**Verification run:** 101 tests pass; all five pre-commit hooks pass.
+
+**Notes**
+
+Accepted as-is. Noted one thing from the log for later (**T-1.11**): the job
+script downloaded from the artifacts bucket reported
+`ServerSideEncryption=AES256`, not the KMS encryption D-13 specifies. Not
+blocking the run, but it contradicts a documented decision and should be checked.
+The job still needs `terraform apply` before the next attempt — this fix changes
+the script, and the IAM statement from entry 010 is still pending.

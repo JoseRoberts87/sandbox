@@ -126,7 +126,7 @@ resource "aws_glue_job" "raw_to_processed" {
     "--source_name"        = var.etl_source_name
     "--dataset"            = var.etl_dataset
     "--source_format"      = var.etl_source_format
-    "--ingest_date"        = "latest"
+    "--ingest_date"        = "today"
     "--max_reject_pct"     = tostring(var.etl_max_reject_pct)
     "--update_catalog"     = "true"
     "--csv_header"         = "true"
@@ -135,8 +135,6 @@ resource "aws_glue_job" "raw_to_processed" {
     # fallback for a dataset with no spec.
     "--csv_infer_schema" = "false"
 
-    # Required columns come from the dataset spec; this only adds to them.
-    "--required_columns" = ""
   }
 
   tags = {

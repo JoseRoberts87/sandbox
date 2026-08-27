@@ -20,12 +20,13 @@ its turn comes, not before.
 
 ## Now — the next three things
 
-1. **T-2.11** — apply phase 2 (buckets, Glue catalog, job, role, disabled schedule).
-2. **T-1.10 / T-2.12** — land `data/dpe_interview_takehome_data.csv` in raw and
-   run the job end to end. The transform rules are verified against the file, but
-   the job itself has never executed.
-3. **T-2.14 / T-2.10** — confirm idempotency on a rerun, then declare the
-   processed table in Terraform now that the schema is known.
+1. **`terraform apply`** — one pending change: `glue:GetSecurityConfiguration`
+   added to the *job* role, matching the fix already made to the crawler role.
+   The job would hit the same denial. (The deployed script is already current.)
+2. **T-1.10 / T-2.12** — `scripts/land_sample_data.sh`, then start the job. The
+   transform rules are verified against the file, but the job has never executed.
+3. **T-2.14 / T-2.10** — confirm idempotency by rerunning the same date, then
+   declare the processed table in Terraform now that the schema is known.
 
 ## Blocked
 
@@ -61,7 +62,7 @@ its turn comes, not before.
 - [x] **T-1.7** Prefix layout settled as `<source>/<dataset>/ingest_date=YYYY-MM-DD/` and documented in [docs/data-layout.md](./docs/data-layout.md) (D-12)
 - [x] **T-1.8** Processed and artifacts buckets created now, alongside the ETL that writes to them (D-11)
 - [ ] **T-1.9** Check the bill after a few days — confirm an idle environment costs roughly the KMS key and nothing else
-- [ ] **T-1.10** Land `data/dpe_interview_takehome_data.csv` in raw at `takehome/orders/ingest_date=2026-08-26/`
+- [ ] **T-1.10** Land `data/dpe_interview_takehome_data.csv` in raw at `takehome/orders/` — run `scripts/land_sample_data.sh`
 
 ## Phase 2 — ETL
 
@@ -74,12 +75,14 @@ its turn comes, not before.
 - [x] **T-2.7** Idempotent reruns by purge-then-write per partition; bookmarks off (revision to D-19)
 - [x] **T-2.8** Row-level validation with quarantine: bad rows go to `_rejected/` with a reason, and the run fails above `--max_reject_pct`. Formal Glue Data Quality rulesets still need a catalog table
 - [ ] **T-2.17** 🔴 Glue Data Quality rulesets — in-job fail-closed checks exist (empty partition, missing required columns); formal rulesets need a catalog table
-- [ ] **T-2.11** Apply phase 2 and confirm the job, role, databases and crawler exist
+- [x] **T-2.11** Phase 2 applied — job, roles, catalog databases, security configuration and crawler all in state
+- [ ] **T-1.11** Confirm objects in the artifacts bucket are KMS-encrypted — the Glue log reported `ServerSideEncryption=AES256` for the job script, which is not what D-13 specifies
 - [ ] **T-2.12** Land a sample file and run the job end to end; confirm Parquet lands in the right partition and the catalog table appears
 - [ ] **T-2.13** Run the raw crawler to discover the real schema (unblocks Q-01, Q-02, T-2.10)
 - [ ] **T-2.14** Verify idempotency for real: run the same date twice, confirm the row count does not double
 - [ ] **T-2.15** Query the processed table in Athena as an independent check on the catalog
 - [ ] **T-2.10** Declare the processed table in Terraform and set `--update_catalog=false` (D-16). The explicit read schema half is **done** — `takehome/orders` declares its types in the job; `inferSchema` is now only a fallback for unspec'd datasets. Do the Terraform half after T-2.12 confirms the written schema
+- [ ] **T-2.18** Decide whether processed should partition on `order_date` instead of `ingest_date` (D-12). Snapshot partitions repeat the whole dataset per run; settle before the phase 3 COPY, since it changes what Redshift reads
 - [ ] **T-2.16** Confirm the two assumptions in `docs/dataset-takehome-orders.md` with whoever owns the source: month-first slash dates, and the `net_amount_usd` definition
 - [ ] **T-2.9** ⚠️ **Migrate state to S3 before Phase 3 starts** — state must not be local once Redshift exists (D-32)
 
@@ -126,5 +129,5 @@ its turn comes, not before.
 - [ ] **T-X.3** Keep `PROJECT_SCOPE.md` decisions and changelog current as choices get made
 - [x] **T-X.4** `pre-commit` runs `terraform_fmt`, `terraform_validate`, `terraform_tflint` and `terraform_checkov` — all passing
 - [x] **T-X.5** `pytest` suite: 96 tests over helpers, dataset-spec invariants and the Spark transform, including the real sample file end to end
-- [ ] **T-X.6** Consider a pre-commit hook for `pytest -m "not spark"` — 0.1s, and it would catch spec mistakes before they reach a Glue run
+- [x] **T-X.6** pre-commit hook runs `pytest -m "not spark"` via the venv interpreter
 - [ ] **T-X.7** Run the suite against pyspark 3.5 as well, to match the Spark version Glue 5.0 actually runs

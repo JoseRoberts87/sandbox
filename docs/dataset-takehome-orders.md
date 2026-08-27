@@ -11,11 +11,22 @@ CSV with header.
 ## Landing it
 
 ```bash
+scripts/land_sample_data.sh
+```
+
+which is equivalent to:
+
+```bash
 RAW=$(terraform -chdir=envs/dev output -raw raw_bucket_name)
 
 aws s3 cp data/dpe_interview_takehome_data.csv \
-  "s3://$RAW/takehome/orders/ingest_date=2026-08-26/dpe_interview_takehome_data.csv"
+  "s3://$RAW/takehome/orders/dpe_interview_takehome_data.csv"
 ```
+
+Raw is flat — no date in the path. The `takehome/orders` prefix must match
+`etl_source_name` and `etl_dataset` in `envs/dev/terraform.tfvars`, since the job
+builds its input path from those. The run writes its output to the `ingest_date`
+partition for the day it runs.
 
 ## Schema
 

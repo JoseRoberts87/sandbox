@@ -19,11 +19,16 @@ S3 (raw) ──Glue──► S3 (processed) ──COPY──► Redshift ──U
    └── built  └── built    └── built (not applied)
 ```
 
-Both data zones share one prefix layout — see [docs/data-layout.md](./docs/data-layout.md):
+Layout — see [docs/data-layout.md](./docs/data-layout.md):
 
 ```
-<source>/<dataset>/ingest_date=YYYY-MM-DD/<file>
+raw        <source>/<dataset>/<file>
+processed  <source>/<dataset>/ingest_date=YYYY-MM-DD/*.parquet
 ```
+
+Raw is flat; a run reads the whole dataset prefix and writes a complete snapshot
+to the `ingest_date` partition for that run. Read the newest partition, not all
+of them.
 
 ## How this project is built
 
@@ -69,24 +74,42 @@ terraform output    # bucket names, Glue job name, catalog databases
 
 ### Landing data
 
+Raw is flat: a file goes under its dataset prefix with no date in the path. The
+job derives that prefix from `--source_name` and `--dataset`, so it must match
+`etl_source_name` / `etl_dataset` in `envs/dev/terraform.tfvars`:
+
+```
+<source>/<dataset>/<file>
+```
+
+For the sample dataset:
+
+```bash
+scripts/land_sample_data.sh
+```
+
+Anything else, by hand:
+
 ```bash
 RAW=$(terraform -chdir=envs/dev output -raw raw_bucket_name)
 
-aws s3 cp ./customers_20260825.csv \
-  "s3://$RAW/acme_crm/customers/ingest_date=2026-08-25/customers_20260825.csv"
+aws s3 cp ./orders_20260826.csv "s3://$RAW/takehome/orders/orders_20260826.csv"
 ```
 
 ### Running the ETL
 
-The job processes one `ingest_date` partition per run. With no arguments it
-picks the most recent partition present:
+A run reads every file under the dataset prefix and writes a complete snapshot
+to one `ingest_date` partition — today's, unless told otherwise:
 
 ```bash
 JOB=$(terraform -chdir=envs/dev output -raw glue_job_name)
 
 aws glue start-job-run --job-name "$JOB"
 
-# a specific date — reruns replace that partition rather than duplicating it
+# redo the most recent load in place, whatever date it was written under
+aws glue start-job-run --job-name "$JOB" --arguments '{"--ingest_date":"latest"}'
+
+# write a specific partition — reruns of a date replace it rather than duplicating
 aws glue start-job-run --job-name "$JOB" \
   --arguments '{"--ingest_date":"2026-08-24"}'
 
@@ -101,6 +124,46 @@ Watch a run:
 aws glue get-job-runs --job-name "$JOB" --max-items 1
 aws logs tail /aws-glue/jobs/output --follow
 ```
+
+### Testing the job end to end
+
+```bash
+# 1. Apply — this also uploads the current job script to the artifacts bucket,
+#    so run it after any change to glue/jobs/raw_to_processed.py
+terraform -chdir=envs/dev apply
+
+# 2. Land the sample data at the expected prefix
+scripts/land_sample_data.sh
+
+# 3. Run the job over the partition just landed
+JOB=$(terraform -chdir=envs/dev output -raw glue_job_name)
+RUN=$(aws glue start-job-run --job-name "$JOB" --query JobRunId --output text)
+
+# 4. Watch it
+aws glue get-job-run --job-name "$JOB" --run-id "$RUN" \
+  --query 'JobRun.{State:JobRunState,Error:ErrorMessage}'
+aws logs tail /aws-glue/jobs/output --follow
+
+# 5. Confirm the output landed in the right partition
+PROCESSED=$(terraform -chdir=envs/dev output -raw processed_bucket_name)
+aws s3 ls "s3://$PROCESSED/takehome/orders/" --recursive
+
+# 6. Confirm the catalog table was created
+aws glue get-table \
+  --database-name "$(terraform -chdir=envs/dev output -raw glue_processed_database)" \
+  --name takehome_orders --query 'Table.StorageDescriptor.Columns[].Name'
+```
+
+Expect 19 rows accepted and no rejects. Anything quarantined appears under
+`s3://$PROCESSED/_rejected/takehome/orders/` with a `reject_reason` column, and
+the run fails if more than `etl_max_reject_pct` of rows are rejected.
+
+Rerunning the same date replaces that partition rather than appending, so step 3
+is safe to repeat.
+
+> Querying the processed table in Athena needs an Athena workgroup and a results
+> bucket, neither of which exists yet. The `aws glue get-table` check above
+> verifies the catalog without them.
 
 ### Discovering a schema
 
@@ -156,6 +219,7 @@ venv/bin/python -m pip install -r requirements-dev.txt
 │       └── raw_to_processed.py
 ├── tests/                  # pytest: helpers, spec invariants, Spark transform
 ├── data/                   # sample source data
+├── scripts/                # land_sample_data.sh
 ├── envs/
 │   └── dev/                # dev environment root module (local state)
 │       ├── main.tf         # locals

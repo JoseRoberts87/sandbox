@@ -60,16 +60,28 @@ accident.
 Two gates, neither needing AWS credentials:
 
 ```bash
-pre-commit run --all-files --verbose      # terraform: fmt, validate, tflint, checkov
-venv/bin/python -m pytest                 # 96 tests
+pre-commit run --all-files --verbose      # terraform hooks + pytest -m "not spark"
+venv/bin/python -m pytest                 # 96 tests, full suite
 venv/bin/python -m pytest -m "not spark"  # 65 of them, no JVM, ~0.1s
 ```
+
+The pre-commit pytest hook must invoke `venv/bin/python -m pytest`, not a bare
+`pytest`: the job module imports pyspark at import time, so even the non-Spark
+tests need it, and a bare `pytest` resolves to whatever is first on PATH.
 
 Tests live in `tests/`, run against the venv in `venv/` (see
 `requirements-dev.txt`). `conftest.py` stubs `awsglue` and `boto3` so the real
 job module can be imported locally; tests call `evaluate_rows` and
 `select_clean` directly, so they exercise deployed code rather than a copy.
 Spark tests are marked `spark` and skip when no JVM is present.
+
+**Never pass `JOB_ID` or `JOB_RUN_ID` to `getResolvedOptions`.** Glue registers
+those itself whenever they appear in argv and special-cases only `JOB_NAME`, so
+requesting them raises `argparse.ArgumentError: conflicting option string` and
+the run dies before `main()` executes. `RESERVED_ARGS` and `argv_value()` in the
+job exist for this; `tests/conftest.py` reproduces the conflict so the suite
+catches a regression. The same trap applies to any other argument Glue supplies
+on its own.
 
 **`configure_session()` in the job is load-bearing — do not remove it.** It sets
 `spark.sql.ansi.enabled=false` and pins the session timezone to UTC. Under ANSI
@@ -135,8 +147,20 @@ like a bucket-policy problem.
 **Prefix layout** (D-12, `docs/data-layout.md`), identical in raw and processed:
 
 ```
-<source>/<dataset>/ingest_date=YYYY-MM-DD/<file>
+raw        <source>/<dataset>/<file>
+processed  <source>/<dataset>/ingest_date=YYYY-MM-DD/*.parquet
 ```
+
+**The zones are deliberately asymmetric.** Raw is flat — a run reads every file
+under the dataset prefix. `ingest_date` is the date of the *run*, so each
+processed partition is a complete snapshot of raw at that moment. Consumers must
+read the newest partition; summing across partitions counts every row once per
+run. Rerunning a date purges and rewrites that partition, so it stays idempotent.
+
+The job derives its input prefix from `--source_name` and `--dataset`, so it must
+match `etl_source_name` / `etl_dataset` in `envs/dev/terraform.tfvars`.
+`scripts/land_sample_data.sh` lands the sample dataset; the end-to-end sequence
+is in the README.
 
 **The ETL contract.** A run is addressed by one date. The job purges the target
 processed partition, then rewrites it, so reruns are idempotent and a backfill is

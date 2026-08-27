@@ -32,14 +32,36 @@ class GlueArgumentError(Exception):
     """Stand-in for the error awsglue raises when a required argument is absent."""
 
 
+class GlueArgumentConflictError(Exception):
+    """argparse.ArgumentError as raised by getResolvedOptions on a reserved name."""
+
+
+# awsglue pre-registers these on its argparse parser whenever they appear in
+# argv, and special-cases only JOB_NAME. Requesting JOB_ID or JOB_RUN_ID
+# therefore raises "conflicting option string" and kills the run at startup.
+# Reproduced here so the suite catches it — it did not, the first time.
+_GLUE_RESERVED = ("JOB_ID", "JOB_RUN_ID")
+
+
 def _get_resolved_options(args, options):
     """Close enough to awsglue.utils.getResolvedOptions to test argument handling."""
     resolved = {}
+
+    for name in _GLUE_RESERVED:
+        flag = f"--{name}"
+        if flag in args:
+            resolved[name] = args[args.index(flag) + 1]
+
     for option in options:
         flag = f"--{option}"
+        if option in _GLUE_RESERVED and flag in args:
+            raise GlueArgumentConflictError(
+                f"argument {flag}: conflicting option string: {flag}"
+            )
         if flag not in args:
             raise GlueArgumentError(f"argument --{option} is required")
         resolved[option] = args[args.index(flag) + 1]
+
     return resolved
 
 
