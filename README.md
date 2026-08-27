@@ -6,17 +6,19 @@ Raw data lands in **S3**, is transformed by **AWS Glue** ETL jobs, loaded into
 **Amazon Redshift**, and used to train a model in **Amazon SageMaker**, which
 serves predictions from an inference endpoint.
 
-> **Status:** Phases 0–1 (Terraform foundations, raw bucket) are applied.
-> Phase 2 (Glue ETL) is written and validated, not yet applied.
-> Architecture and decisions are in [PROJECT_SCOPE.md](./PROJECT_SCOPE.md);
-> progress and next actions are in [TODO.md](./TODO.md).
+> **Status:** All infrastructure through phase 5 is applied. The data path runs
+> end to end as far as the warehouse: raw → Glue → processed → Redshift.
+> Training has not yet run, so no model is deployed and the inference stack is
+> intentionally empty. Architecture and decisions are in
+> [PROJECT_SCOPE.md](./PROJECT_SCOPE.md); progress and next actions are in
+> [TODO.md](./TODO.md).
 
 ## Architecture
 
 ```
-S3 (raw) ──Glue──► S3 (processed) ──Spectrum──► Redshift ──UNLOAD──► SageMaker ──► endpoint
-   ▲          ▲            ▲                          ▲
-   └─ applied └─ applied   └─ applied (job unverified) └─ written, not applied
+S3 (raw) ──Glue──► S3 (processed) ──Spectrum──► Redshift ──UNLOAD──► SageMaker
+                                                                          │
+                                          external caller ──► API Gateway ──► Lambda ──┘
 ```
 
 Layout — see [docs/data-layout.md](./docs/data-layout.md):
@@ -316,6 +318,70 @@ venv/bin/python ml/train.py --train <dir-of-csv> --model-dir <out>
 > indistinguishable from guessing, and correctly so. The training script says as
 > much in its own output. The deliverable here is the pipeline, not the model.
 
+### Deploying the model
+
+Two deliberate steps (D-31). Approving says a version is fit to serve; setting
+the ARN is what actually serves it:
+
+```bash
+# 1. approve the newest pending version
+scripts/promote_model.sh
+
+# 2. paste the ARN it prints into envs/dev/terraform.tfvars
+#      approved_model_package_arn = "arn:aws:sagemaker:..."
+terraform -chdir=envs/dev apply
+```
+
+The first apply raises the endpoint, the Lambda proxy and the public API.
+Later ones roll the endpoint onto the new version in place. Clearing the ARN
+removes the whole inference stack.
+
+> **Nothing exists until a model is approved.** `approved_model_package_arn`
+> gates the endpoint, the Lambda and the API Gateway, so phase 5 applies cleanly
+> before any model has been trained — it simply creates none of it.
+
+### Calling the API
+
+A SageMaker endpoint cannot be called from outside AWS, so consumers go through
+API Gateway with an API key (D-30):
+
+```bash
+URL=$(terraform -chdir=envs/dev output -raw predict_url)
+KEY=$(aws apigateway get-api-key \
+  --api-key "$(terraform -chdir=envs/dev output -raw predict_api_key_id)" \
+  --include-value --query value --output text)
+
+curl -X POST "$URL" \
+  -H "x-api-key: $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"instances":[{"region":"EMEA","channel":"retail","category":"puzzles",
+       "quantity":2,"unit_price_usd":30.0,"discount_pct":0.0,"order_dow":3}]}'
+```
+
+```json
+{"predictions": [{"refund_probability": 0.221630}]}
+```
+
+Verify the whole path end to end:
+
+```bash
+scripts/smoke_test_endpoint.sh
+```
+
+It checks valid single and batch requests, unseen categorical values, three
+malformed payloads, and that a request with no API key is refused.
+
+| Response | Meaning |
+|---|---|
+| `200` | Prediction. One entry per instance, in order |
+| `400` | Your request — malformed JSON, no instances, missing fields, or too many rows |
+| `503` | The endpoint scaled to zero and is warming up. Retry |
+| `502` | Our side. The detail is in CloudWatch, deliberately not in the response |
+
+> **Cold starts.** The endpoint scales to zero, so the first call after a quiet
+> period takes several seconds and may return 503 before it is ready. That is
+> the trade for an endpoint that costs nothing while idle (D-29).
+
 ### Discovering a schema
 
 The raw crawler is on-demand and exists only to answer "what is actually in this
@@ -372,7 +438,8 @@ venv/bin/python -m pip install -r requirements-dev.txt
 ├── data/                   # sample source data
 ├── scripts/                # land_sample_data.sh, redshift_sql.sh
 ├── sql/                    # Redshift DDL migrations, partition load, UNLOAD
-├── ml/                     # train.py — runs locally and in SageMaker unchanged
+├── ml/                     # train.py, inference.py — run locally and in SageMaker
+├── lambda/predict/         # API Gateway -> SageMaker proxy
 ├── envs/
 │   └── dev/                # dev environment root module
 │       ├── backend.tf      # remote state; remove this file to go local
@@ -380,6 +447,11 @@ venv/bin/python -m pip install -r requirements-dev.txt
 │       ├── kms.tf          # data lake encryption key
 │       ├── storage.tf      # raw / processed / artifacts buckets
 │       ├── glue.tf         # catalog databases, ETL job, crawler, schedule
+│       ├── network.tf      # VPC for Redshift; no NAT by design
+│       ├── redshift.tf     # Serverless namespace, workgroup, usage limit
+│       ├── sagemaker.tf    # execution role, model registry
+│       ├── inference.tf    # endpoint (gated on an approved model)
+│       ├── api.tf          # Lambda proxy, API Gateway, key and quota
 │       └── iam.tf          # Glue job, crawler and scheduler roles
 └── modules/
     └── s3_bucket/          # reusable private, encrypted bucket

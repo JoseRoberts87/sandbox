@@ -1005,3 +1005,184 @@ and needs checking before the first run (T-4.8) — a wrong URI fails
 `create-training-job` immediately, so it is cheap to be wrong. The dependency
 chain is now four deep: T-4.9 waits on T-3.8, which waits on T-2.12, which waits
 on an apply. Nothing downstream of the Glue job has run against AWS.
+
+---
+
+### 016 — Phase 5: serverless endpoint behind a public API
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `ml/inference.py` (new), `lambda/predict/handler.py` (new), `envs/dev/{inference,api}.tf` (new), `envs/dev/{kms,variables,outputs}.tf`, `envs/dev/{versions,terraform.tfvars}`, `scripts/{promote_model,smoke_test_endpoint}.sh` (new), `scripts/train_model.sh`, `tests/test_inference.py` and `tests/test_predict_lambda.py` (new), `README.md`, `CLAUDE.md`, `PROJECT_SCOPE.md`, `TODO.md`
+
+**Prompt**
+
+```text
+ive merged the code to main and ran terraform apply, it is all deployed. lets proceed with phase 5
+```
+
+**Output**
+
+Asked Q-03 and Q-04 first — both are flagged in the scope as blocking, and they
+change what gets built rather than a config value. **Answers: consumers outside
+AWS, and Serverless Inference.** Consumers outside AWS is the expensive answer:
+a SageMaker endpoint cannot be called from outside AWS at all, so it needs a
+real front door rather than an invoke policy.
+
+**`ml/inference.py`.** The managed sklearn container's default `predict_fn`
+calls `model.predict()` and returns a class label — useless for something whose
+entire output is a *risk score*. The handler returns `predict_proba`, accepts
+three JSON shapes plus CSV, and imports the feature list from `train.py` rather
+than restating it: both files ship in one source archive, so there is a single
+definition of what the model consumes (D-27 again).
+
+**The proxy.** API Gateway REST — not HTTP API, which has no native API keys —
+with an API key, throttle, and a **daily quota**, because the endpoint scales
+with demand and an unmetered key is an unmetered bill. A Lambda holds the IAM
+identity, scoped to `sagemaker:InvokeEndpoint` on that one endpoint. It returns
+400 for what the caller can fix (passing through the model's own missing-field
+message), 503 with retry advice for a cold start, and a bare `prediction failed`
+for anything else — an external caller should never learn a role ARN from an
+error, and a test asserts none does.
+
+**Gating.** The whole inference stack is conditional on
+`approved_model_package_arn`, so phase 5 applies cleanly with no model trained
+and creates nothing. Setting that ARN is the promotion step. Flagged the
+consequence rather than leaving it to be discovered: because the front door is
+gated on the same variable, clearing it destroys the API key and URL along with
+the endpoint. Fine now, wrong once a key has been issued — **T-5.9**.
+
+**Checkov: 14 findings, triaged individually.** Two fixed — `create_before_destroy`
+on the REST API, and network isolation on the model, which is genuinely right
+for a pipeline that scores in memory (behind a variable, since it is the first
+thing to flip if an endpoint will not reach `InService`). The rest are
+documented skips with reasons: a DLQ catches only asynchronous invocations and
+API Gateway is synchronous; caching a prediction API would serve stale scores
+after a model swap; KMS key policies always use `Resource "*"`, which is what
+"this key" means; serverless endpoint configs have no storage volume to encrypt.
+Three are real-but-deferred and got tasks (T-6.7, T-6.8, T-6.9).
+
+Adding a **CloudWatch Logs KMS key** for the new log groups also completes the
+hard half of T-6.6 — the `logs.<region>.amazonaws.com` key policy that was
+deferred in entry 007 precisely because it could not be verified without
+applying. It now gets exercised by the Lambda and API log groups first, which is
+the right order to prove it.
+
+**Verification run:** the inference handler was run against a **real fitted
+artifact** — all four payload shapes, unseen categorical values, and each
+rejection path. 35 new tests (154 total, all passing); all five pre-commit hooks
+pass.
+
+**Notes**
+
+Accepted as-is, unapplied. One housekeeping note: fetching the new `archive`
+provider without credentials required removing `.terraform/terraform.tfstate`,
+so `terraform init` is needed to reconnect the S3 backend before the next apply.
+The pipeline still has not run end to end — T-5.8 sits behind T-4.9, T-3.8 and
+T-2.12, and the Glue job has yet to complete a single successful run.
+
+---
+
+### 017 — Post-apply: tracker update and a validation checklist
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `scripts/redshift_query.sh` (new), `TODO.md`, `README.md`, `PROJECT_SCOPE.md`
+
+**Prompt**
+
+```text
+assume all terraform apply has been succesful, update the todos and give me a list of things to check and validate and how. before creating the list, make sure to update your knwledge
+```
+
+**Output**
+
+Re-read the repository before writing anything, which corrected a stale belief.
+`git log -S` showed the user had checked off **T-2.12, T-2.13, T-2.14, T-3.6,
+T-3.7, T-3.8 and T-1.11** in commit `4702822`: the Glue job has run, the crawler
+has run, idempotency was verified, and a snapshot has been loaded into Redshift.
+Statements in the previous two entries that the pipeline had never run end to
+end were out of date. The real gap is training onward.
+
+Also re-read `outputs.tf`, `terraform.tfvars`, `scripts/` and the job's naming so
+the checklist would reference real output names rather than remembered ones.
+
+Added **`scripts/redshift_query.sh`**: `redshift_sql.sh` applies files and
+reports success, but returns no rows, so every data check would otherwise be a
+three-call `execute-statement` / `describe-statement` / `get-statement-result`
+incantation. Verified the result formatter against a realistic Data API
+response, including a null cell.
+
+**`TODO.md`** rewritten where it was wrong: T-4.7 and phase 5's apply marked
+done; the Now section rewritten around training and deployment; the Blocked
+table corrected, since T-2.12 and T-3.8 no longer block anything. Noted that
+T-6.1 is only partly done — the Lambda and API log groups carry explicit
+retention but exist only once inference is enabled, while Glue and SageMaker
+still create theirs implicitly with no expiry.
+
+Three verification tasks added that did not exist: **T-3.13** (a clean
+`terraform plan`, which is what proves the deployment matches the commit and
+that nothing was edited in the console), **T-5.11** (confirm the inference gate
+works in the negative — nothing exists while the ARN is empty), and **T-X.8**
+for the query helper.
+
+The checklist itself was delivered in the reply, in five groups: infrastructure
+sanity, the already-run data path, the untested remainder, cost guards, and the
+known-risk items.
+
+**Verification run:** all five pre-commit hooks pass.
+
+**Notes**
+
+Accepted as-is. The correction matters beyond bookkeeping: several documents
+still claimed the pipeline had never run, and `README.md` and `PROJECT_SCOPE.md`
+were updated to match what is actually deployed.
+
+---
+
+### 018 — `schema "analytics" does not exist`
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `scripts/redshift_sql.sh`, `TODO.md`, `PROJECT_SCOPE.md`
+
+**Prompt**
+
+```text
+i ran this command `bash scripts/redshift_query.sh "SELECT count(*) AS orders, count(DISTINCT order_id) AS ids, min(order_date) AS first, max(order_date) AS last FROM analytics.orders"` and got this response `ERROR: schema "analytics" does not exist`
+```
+
+**Output**
+
+**Diagnosis: the migrations were never applied.** `terraform apply` does not run
+them — DDL is a separate, deliberate step by design (D-38), and it was missed.
+The knock-on is that **T-3.8 could not have succeeded either**:
+`sql/load_orders.sql` targets `landing.orders`, which cannot exist while the
+schemas do not. Both tasks had been checked off; both were reopened, and the
+scope status corrected — the data path is proven as far as the processed zone,
+not as far as the warehouse.
+
+**Found a real bug in `scripts/redshift_sql.sh` while checking whether it could
+have reported a false success.** If the file list came back empty — a directory
+with no `.sql` files — the loop body never ran and the script printed `done` and
+exited 0, having applied nothing. Reproduced it, then fixed: the script now
+fails on an empty match, checks a named file exists, announces how many files it
+is about to apply and to which database, and reports the count at the end
+instead of a bare `done`. Whether or not that is what happened here, "applied
+nothing" must never exit 0 from a script whose whole job is applying schema.
+
+Gave the user a diagnostic sequence that distinguishes *never ran* from *ran and
+failed* — listing `pg_namespace` and checking `current_database()` — rather than
+assuming, plus the fix and a re-verification path.
+
+**Verification run:** reproduced the empty-list silent success before the fix,
+confirmed the guard exits 1 after. All five pre-commit hooks pass.
+
+**Notes**
+
+Accepted as-is. The tracker had two tasks marked done that demonstrably were
+not, which is worth noting as a process point: checking a box at apply time is
+not the same as verifying the thing. The validation checklist in entry 017 is
+what caught it, on its first real use.

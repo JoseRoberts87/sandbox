@@ -44,7 +44,10 @@ scripts/redshift_sql.sh sql/unload_training_set.sql "training_prefix=${TRAINING_
 echo "==> 2/4 packaging training source to $SOURCE_URI"
 STAGING=$(mktemp -d)
 trap 'rm -rf "$STAGING"' EXIT
-tar -czf "$STAGING/sourcedir.tar.gz" -C ml train.py
+# Both files: train.py runs in the training container, inference.py in the
+# endpoint, and inference.py imports the feature list from train.py so the two
+# cannot drift (D-27).
+tar -czf "$STAGING/sourcedir.tar.gz" -C ml train.py inference.py
 aws s3 cp "$STAGING/sourcedir.tar.gz" "$SOURCE_URI"
 
 echo "==> 3/4 training job $JOB_NAME"
@@ -101,7 +104,17 @@ json.dump({
     "ModelPackageDescription": "Refund risk, trained from $TRAINING_URI",
     "ModelApprovalStatus": "PendingManualApproval",
     "InferenceSpecification": {
-        "Containers": [{"Image": "$IMAGE", "ModelDataUrl": "$MODEL_DATA"}],
+        # Without these the container falls back to its default handler, whose
+        # predict_fn returns a class label rather than a probability — which is
+        # the entire point of a risk score.
+        "Containers": [{
+            "Image": "$IMAGE",
+            "ModelDataUrl": "$MODEL_DATA",
+            "Environment": {
+                "SAGEMAKER_PROGRAM": "inference.py",
+                "SAGEMAKER_SUBMIT_DIRECTORY": "$SOURCE_URI",
+            },
+        }],
         "SupportedContentTypes": ["text/csv", "application/json"],
         "SupportedResponseMIMETypes": ["text/csv", "application/json"],
     },
@@ -117,8 +130,8 @@ Registered: $PACKAGE_ARN
   trained from : $TRAINING_URI
   artifact     : $MODEL_DATA
 
-It is PendingManualApproval and deploys nowhere until approved (D-31):
+It is PendingManualApproval and deploys nowhere until approved (D-31). To
+promote it:
 
-  aws sagemaker update-model-package --model-package-arn "$PACKAGE_ARN" \\
-    --model-approval-status Approved
+  scripts/promote_model.sh "$PACKAGE_ARN"
 MSG

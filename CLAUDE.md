@@ -204,6 +204,21 @@ role and the Model Registry group; `scripts/train_model.sh` unloads, trains and
 registers a version as `PendingManualApproval`. Nothing deploys on its own
 (D-31).
 
+**The inference stack is gated on `approved_model_package_arn`.** Empty means no
+endpoint, no Lambda, no API Gateway — `apply` creates none of it. Setting that
+ARN is the promotion step (D-31), so the served model version lives in version
+control. Approving a version in the registry deploys nothing by itself.
+
+**`ml/inference.py` exists because the container's default `predict_fn` returns
+a class label**, and this model's output is a risk score. It imports the feature
+list from `train.py` — both ship in one source archive, so there is a single
+definition of what the model consumes. Do not restate the list.
+
+**The Lambda proxy must not leak internals.** It returns 400 for what the caller
+can fix (including the model's own missing-field message), 503 with retry advice
+for a serverless cold start, and a bare `prediction failed` for anything else.
+`tests/test_predict_lambda.py` asserts no role ARN reaches the response body.
+
 **Redshift Serverless is the only component that can run up a bill on its own.**
 Base capacity is pinned to the 8 RPU floor and a monthly usage limit is set to
 `deactivate` on breach. If queries suddenly fail, check the usage limit before

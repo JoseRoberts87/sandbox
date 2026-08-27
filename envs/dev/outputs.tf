@@ -122,3 +122,28 @@ output "sagemaker_max_runtime_seconds" {
   description = "Training job timeout."
   value       = var.sagemaker_max_runtime_seconds
 }
+
+output "inference_enabled" {
+  description = "Whether an approved model is configured. False means the endpoint, Lambda and API do not exist."
+  value       = local.inference_enabled
+}
+
+output "endpoint_name" {
+  description = "SageMaker Serverless endpoint serving the approved model."
+  value       = local.inference_enabled ? aws_sagemaker_endpoint.refund_risk[0].name : null
+}
+
+output "predict_url" {
+  description = "Public prediction URL. Requires the x-api-key header."
+  value       = local.inference_enabled ? "${aws_api_gateway_stage.predict[0].invoke_url}/predict" : null
+}
+
+output "predict_api_key_id" {
+  description = "API key ID. Read the value with `aws apigateway get-api-key --api-key <id> --include-value`."
+  value       = local.inference_enabled ? aws_api_gateway_api_key.predict[0].id : null
+}
+
+output "deployed_model_package_arn" {
+  description = "Model Registry version currently being served."
+  value       = var.approved_model_package_arn != "" ? var.approved_model_package_arn : null
+}
