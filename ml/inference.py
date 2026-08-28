@@ -5,7 +5,7 @@ The managed scikit-learn container has default handlers, but its default
 exists to give a *risk score*, so the whole point is `predict_proba`. Hence an
 explicit handler.
 
-The feature list is imported from `train.py` rather than restated. Both files
+The feature list is imported from `features.py`, not restated. All three files
 ship in the same source archive, so there is exactly one definition of what the
 model consumes — restating it here is how inference and training drift apart
 (D-27).
@@ -25,7 +25,8 @@ import os
 import joblib
 import pandas as pd
 
-from train import FEATURES, MODEL_FILENAME, METADATA_FILENAME
+from features import FEATURES
+from train import METADATA_FILENAME, MODEL_FILENAME
 
 JSON_CONTENT_TYPE = "application/json"
 CSV_CONTENT_TYPE = "text/csv"

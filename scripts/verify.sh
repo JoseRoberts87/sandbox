@@ -45,6 +45,21 @@ case $? in
 esac
 
 # --------------------------------------------------------------------------
+group "Deployed code matches the working tree"
+
+ARTIFACTS=$(tf_output artifacts_bucket_name)
+DEPLOYED=$(aws s3 cp "s3://$ARTIFACTS/glue/scripts/raw_to_processed.py" - 2>/dev/null \
+  | python3 -c 'import hashlib,sys; print(hashlib.md5(sys.stdin.buffer.read()).hexdigest())') || DEPLOYED=""
+LOCAL=$(python3 -c 'import hashlib; print(hashlib.md5(open("glue/jobs/raw_to_processed.py","rb").read()).hexdigest())')
+
+if [[ -z "$DEPLOYED" ]]; then
+  skip "glue job script" "could not read it from the artifacts bucket"
+elif [[ "$DEPLOYED" == "$LOCAL" ]]; then
+  ok "glue job script matches the working tree"
+else
+  bad "deployed glue job script is stale" "Run: make apply — the job would run the previous version"
+fi
+
 group "Raw and processed zones"
 
 if aws s3 ls "s3://$RAW/$PREFIX/" >/dev/null 2>&1 && \
@@ -172,5 +187,24 @@ else
 fi
 
 # --------------------------------------------------------------------------
-printf '\n\033[1m%d passed, %d failed, %d skipped\033[0m\n' "$PASS" "$FAIL" "$SKIP"
-[[ "$FAIL" -eq 0 ]]
+rule="────────────────────────────────────────────────────────────────"
+
+if [[ "$FAIL" -eq 0 ]]; then
+  printf '\n\033[32m%s\n' "$rule"
+  printf '  HEALTHY — %d checks passed' "$PASS"
+  [[ "$SKIP" -gt 0 ]] && printf ', %d skipped' "$SKIP"
+  printf '\n\n'
+  printf '  What is deployed matches the configuration, the data path holds,\n'
+  printf '  and the cost guards are in place.\n'
+  [[ "$SKIP" -gt 0 ]] && printf '  Skipped checks are noted above with the reason.\n'
+  printf '%s\033[0m\n' "$rule"
+  exit 0
+fi
+
+printf '\n\033[31m%s\n' "$rule" >&2
+printf '  PROBLEMS FOUND — %d of %d checks failed\n\n' "$FAIL" "$((PASS + FAIL))" >&2
+printf '  Each failing line above names the fix. Work down the list in\n' >&2
+printf '  order: a stale deployment or a missing schema makes everything\n' >&2
+printf '  after it fail too.\n' >&2
+printf '%s\033[0m\n' "$rule" >&2
+exit 1

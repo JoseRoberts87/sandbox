@@ -157,3 +157,13 @@ output "etl_dataset" {
   description = "Dataset segment of the dataset prefix."
   value       = var.etl_dataset
 }
+
+output "sample_data_key" {
+  description = "Where the seeded sample file lands in the raw zone, if seeding is on."
+  value       = var.seed_sample_data ? aws_s3_object.sample_data[0].key : null
+}
+
+output "predict_required_fields" {
+  description = "Fields the API requires on every instance. Read by the smoke test so it cannot fall behind the deployed contract."
+  value       = var.predict_required_fields
+}

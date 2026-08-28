@@ -20,6 +20,8 @@ def inference():
     # inference.py imports train.py as a sibling, exactly as it does in the
     # container, where both live in the extracted source directory.
     sys.path.insert(0, str(ROOT / "ml"))
+    import features  # noqa: F401
+
     spec = importlib.util.spec_from_file_location("inference", ROOT / "ml" / "inference.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -28,8 +30,10 @@ def inference():
 
 @pytest.fixture(scope="session")
 def train():
-    spec = importlib.util.spec_from_file_location("train_mod", ROOT / "ml" / "train.py")
+    sys.path.insert(0, str(ROOT / "ml"))
+    spec = importlib.util.spec_from_file_location("train", ROOT / "ml" / "train.py")
     module = importlib.util.module_from_spec(spec)
+    sys.modules["train"] = module
     spec.loader.exec_module(module)
     return module
 

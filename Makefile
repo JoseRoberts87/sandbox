@@ -88,7 +88,7 @@ migrate: ## Apply the Redshift schema migrations (not done by terraform apply)
 reset-catalog: ## Delete the processed catalog table so the next ETL run recreates it
 	scripts/reset_catalog_table.sh
 
-rebuild: ## Full rebuild after a transform change: re-run the ETL, then the warehouse
+rebuild: ## Re-run everything after a *transform change* — clears stale catalog and tables first
 	@echo "Rebuilding after a schema change. Run 'make apply' first if the job"
 	@echo "script changed, or the ETL will rewrite the old shape."
 	@echo
@@ -121,7 +121,7 @@ query: ## Run one SQL statement:  make query SQL="SELECT 1"
 ##@ Composite
 deploy: init apply ## Initialise and apply infrastructure
 
-data: land etl migrate load ## Run the whole data path: land, transform, migrate, load
+data: land etl migrate load ## Run the data path on a fresh environment — start here after `make deploy`
 
 model: train promote ## Train a candidate and approve it
 

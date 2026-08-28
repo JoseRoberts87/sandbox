@@ -69,6 +69,28 @@ class TestEveryScript:
         )
 
 
+@pytest.mark.parametrize(
+    "script", ["smoke_test_endpoint.sh", "verify.sh"], ids=lambda n: n
+)
+class TestVerdicts:
+    """Both scripts answer "did it work?", so the answer must be unmissable in a
+    wall of JSON, and must exit non-zero when it is no."""
+
+    @pytest.fixture
+    def source(self, script):
+        return (ROOT / "scripts" / script).read_text()
+
+    def test_states_a_verdict_both_ways(self, source):
+        assert re.search(r"PASSED|HEALTHY", source), "no success verdict"
+        assert re.search(r"FAILED|PROBLEMS FOUND", source), "no failure verdict"
+
+    def test_counts_what_it_checked(self, source):
+        assert re.search(r"%d (of %d )?check", source), "verdict states no count"
+
+    def test_exits_non_zero_on_failure(self, source):
+        assert "exit 1" in source
+
+
 class TestMakefile:
     @pytest.fixture(scope="class")
     def makefile(self):

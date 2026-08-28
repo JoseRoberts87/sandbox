@@ -7,6 +7,7 @@ laptop, which is what makes it testable at all.
 import importlib.util
 import json
 import re
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -18,8 +19,15 @@ VIEW_SQL = ROOT / "sql" / "migrations" / "005_ml_training_view.sql"
 
 @pytest.fixture(scope="session")
 def train():
+    # Registered in sys.modules under its real name, as the SageMaker container
+    # does. Without that the fitted pipeline cannot be pickled: it references
+    # features.normalise_text by module path.
+    sys.path.insert(0, str(ROOT / "ml"))
+    import features  # noqa: F401
+
     spec = importlib.util.spec_from_file_location("train", ROOT / "ml" / "train.py")
     module = importlib.util.module_from_spec(spec)
+    sys.modules["train"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -75,20 +83,48 @@ class TestFeatureContract:
         declared = re.findall(r'"([a-z_]+)"', block.group(1))
         assert declared == train.FEATURES
 
-    def test_readme_example_carries_every_required_field(self, train):
-        """The contract lives in four places: the training view, this script,
-        the Terraform-declared API contract, and the README's worked example.
-        The first three had drift tests; the example did not, and went stale —
-        it would have returned 400 for a missing field."""
-        readme = (ROOT / "README.md").read_text()
-        payloads = re.findall(r'\{"instances":\s*\[\{(.*?)\}\]', readme, re.S)
-        assert payloads, "no example request found in the README"
+    @pytest.mark.parametrize(
+        "path,description",
+        [
+            ("README.md", "the worked example"),
+            ("scripts/smoke_test_endpoint.sh", "the smoke test payloads"),
+        ],
+    )
+    def test_example_payloads_carry_every_required_field(self, train, path, description):
+        """The contract appears in five places: the training view, this script,
+        the Terraform-declared API contract, the README example, and the smoke
+        test. Each one without a drift test has gone stale in turn — the README
+        first, then the smoke test, both within a turn of the feature list
+        changing. This covers the two that are prose rather than code.
 
-        for payload in payloads:
+        Payloads that are *meant* to be incomplete are skipped: a request with
+        one field is the rejection case, not drift.
+        """
+        text = (ROOT / path).read_text()
+
+        # Inline `{"instances":[{...}]}` blocks, plus shell payload variables.
+        # The smoke test factors its payloads into ORDER= and OTHER=, which the
+        # inline pattern alone does not see — the very payloads most likely to
+        # go stale.
+        payloads = re.findall(r'\{"instances":\s*\[\{(.*?)\}\]', text, re.S)
+        payloads += re.findall(r"^(?:ORDER|OTHER)='\{(.*?)\}'", text, re.M)
+        assert payloads, f"no example request found in {path}"
+
+        complete = [p for p in payloads if len(re.findall(r'"[a-z_]+":', p)) > 1]
+        assert complete, f"no complete example in {path} ({description})"
+
+        for payload in complete:
             fields = set(re.findall(r'"([a-z_]+)":', payload))
-            assert set(train.FEATURES) <= fields, (
-                f"README example is missing {sorted(set(train.FEATURES) - fields)}"
-            )
+            missing = set(train.FEATURES) - fields
+            assert not missing, f"{path}: {description} is missing {sorted(missing)}"
+
+    def test_the_smoke_test_shares_one_payload_definition(self):
+        """The payloads used to be repeated inline per case, so adding a field
+        meant editing each one and missing some. They now come from two
+        variables."""
+        script = (ROOT / "scripts" / "smoke_test_endpoint.sh").read_text()
+        assert re.search(r"^ORDER='", script, re.M)
+        assert re.search(r"^OTHER='", script, re.M)
 
     def test_no_feature_is_listed_twice(self, train):
         assert len(train.FEATURES) == len(set(train.FEATURES))
@@ -136,7 +172,25 @@ class TestPipeline:
         # D-27: one object, one code path, so inference cannot preprocess
         # differently from training.
         pipeline = train.build_pipeline(train.parse_args([]))
-        assert [name for name, _ in pipeline.steps] == ["preprocess", "model"]
+        assert [name for name, _ in pipeline.steps] == ["normalise", "preprocess", "model"]
+
+    def test_text_normalisation_ships_inside_the_model(self, train, frame):
+        """The ETL lowercases every string column, so the model learned from
+        lowercase values. Without the same cleaning at inference, "EMEA" would
+        be an unseen category encoded as all zeros — a quietly worse prediction
+        rather than an error. It lives in the pipeline so both paths share it."""
+        pipeline = train.build_pipeline(train.parse_args([]))
+        pipeline.fit(frame[train.FEATURES], frame[train.TARGET])
+
+        tidy = pd.DataFrame([{
+            "region": "emea", "channel": "retail", "category": "puzzles",
+            "quantity": 2, "unit_price_usd": 30.0, "discount_pct": 0.0,
+            "shipping_days": 4, "order_dow": 3,
+        }])
+        shouty = tidy.copy()
+        shouty.loc[0, ["region", "channel", "category"]] = ["  EMEA ", "Retail", "PUZZLES"]
+
+        assert pipeline.predict_proba(tidy)[0][1] == pipeline.predict_proba(shouty)[0][1]
 
     def test_unseen_categories_do_not_raise(self, train, frame):
         pipeline = train.build_pipeline(train.parse_args([]))

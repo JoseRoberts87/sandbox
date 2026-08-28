@@ -34,27 +34,18 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
 
-TARGET = "is_refunded"
-ID_COLUMNS = ["order_id"]
-
-# Must match the SELECT list in 005_ml_training_view.sql. A mismatch is caught
-# at training time by the column check in load_training_data().
-CATEGORICAL_FEATURES = ["region", "channel", "category"]
-# shipping_days is included deliberately (TR-15). It looks like leakage and is
-# not: it is populated on pending orders, which have not shipped, and cancelled
-# ones, which never will — so it is an estimate available when the order is
-# placed. If the source says otherwise, remove it here and from the training
-# view together, or the drift test fails.
-NUMERIC_FEATURES = [
-    "quantity",
-    "unit_price_usd",
-    "discount_pct",
-    "shipping_days",
-    "order_dow",
-]
-FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
+# Re-exported so `train.FEATURES` keeps working for callers and tests. The
+# definitions live in features.py — see the note there on pickling.
+from features import (  # noqa: E402
+    CATEGORICAL_FEATURES,
+    FEATURES,
+    ID_COLUMNS,
+    NUMERIC_FEATURES,
+    TARGET,
+    normalise_text,
+)
 
 MODEL_FILENAME = "model.joblib"
 METADATA_FILENAME = "model_metadata.json"
@@ -134,7 +125,15 @@ def build_pipeline(args):
         C=args.regularisation_c,
         random_state=args.seed,
     )
-    return Pipeline([("preprocess", preprocess), ("model", model)])
+    return Pipeline(
+        [
+            # First, so every downstream step sees the same shape of value the
+            # ETL produced.
+            ("normalise", FunctionTransformer(normalise_text, feature_names_out=None)),
+            ("preprocess", preprocess),
+            ("model", model),
+        ]
+    )
 
 
 def evaluate(pipeline, features, labels, folds, seed):

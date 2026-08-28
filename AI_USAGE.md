@@ -2181,3 +2181,344 @@ run against AWS.
 
 Accepted as-is. `make model` still stops after approval by design — it records
 the ARN, it does not apply.
+
+---
+
+### 035 — Seed the sample data, and document what Terraform cannot do
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `envs/dev/{storage,variables,outputs}.tf`, `README.md`, `PROJECT_SCOPE.md`, `TODO.md`
+
+**Prompt**
+
+```text
+lets push this artifact `data/dpe_interview_takehome_data.csv` into the
+sandbox-dev-raw-data-platform bucket after the bucket is created so that the
+pipeline works without any intervention. additionally add on the readme any
+manual dependencies on aws that terraform cannot complete
+```
+
+**Output**
+
+**Seeding the raw zone from Terraform crosses a line D-38 draws** — Terraform
+owns infrastructure, not data in S3 — so it was implemented as a scoped,
+recorded exception rather than slipped in. It is acceptable only because the
+file is a committed fixture. Managing a real feed this way would make the raw
+zone, the single copy everything else is regenerable from, a function of a plan:
+deleted on destroy, restored on drift. It sits behind `seed_sample_data`, and
+**T-6.10** requires that to be false once a real source exists.
+
+Verified the seeded key resolves to exactly the prefix the job reads and the one
+`make land` writes, so the two cannot disagree. Also documented the consequence
+that follows from Terraform owning that object: replacing that exact key by hand
+is reverted on the next apply.
+
+**The manual-dependencies section** lists what sits outside any configuration,
+with the symptom each produces rather than just the requirement — the state
+bucket, credentials, **service quotas** (a new account can have a quota of zero
+for an instance family, which surfaces as `ResourceLimitExceeded` from
+`make train`), Cost Explorer needing enablement before a budget reports
+anything, billing access for non-root principals, three usable availability
+zones for Redshift Serverless, and global S3 bucket-name uniqueness given that
+the suffix here is the owner tag rather than the account id. Included the
+`service-quotas` commands to check the two that matter before a first deploy,
+and repeated that `aws_api_gateway_account` is account-wide.
+
+**Fixed a broken anchor and removed the cause.** Renaming a heading left a stale
+link; while fixing it, two anchor targets contained em dashes, which renderers
+slug inconsistently. Rather than guess the right number of hyphens, the
+punctuation was dropped from both headings so the anchors are unambiguous.
+
+**Verification run:** 244 tests pass; all five pre-commit hooks pass, checkov
+clean with the new object. All anchors and relative links resolve. Nothing was
+run against AWS.
+
+**Notes**
+
+Accepted as-is. On the next apply the sample file appears in the raw zone, so a
+fresh environment goes straight from `make deploy` to `make etl`. The quota and
+Cost Explorer items are the ones most likely to matter in an unfamiliar account,
+and neither can be resolved by anything in this repository.
+
+---
+
+### 036 — Smoke test drift, and the real skew it exposed
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `ml/features.py` (new), `ml/{train,inference}.py`, `scripts/{smoke_test_endpoint,train_model}.sh`, `envs/dev/outputs.tf`, `tests/{test_train,test_inference}.py`, `README.md`, `PROJECT_SCOPE.md`, `TODO.md`
+
+**Prompt**
+
+```text
+[terraform outputs, then]
+  FAIL  valid single order -> 400 (expected 200)
+        {"error": "instance 0 is missing required fields: ['shipping_days']"}
+```
+
+**Output**
+
+The immediate cause was drift I had just written a test for and applied too
+narrowly. Adding `shipping_days` in entry 030 required updating five places; I
+fixed four and covered only the README with a drift test. The smoke test was the
+fifth, and it went stale within two turns — the same pattern noted in entry 033,
+repeating because the lesson was applied to one file instead of the class.
+
+The payloads were also repeated inline per case, so the fix now defines them
+once and every case varies only what it tests.
+
+**Reading those payloads surfaced something worse.** They sent `"EMEA"`, but the
+ETL lowercases every string column, so the model learned `"emea"`. Nothing
+normalised the inference input, so `handle_unknown="ignore"` encoded it as all
+zeros — **not an error, a quietly worse prediction**. That is real
+training/serving skew, and precisely the failure D-27 exists to prevent. It had
+been sitting in every prediction the endpoint had served.
+
+Fixed by moving the ETL's text cleaning into the pipeline as its first step, so
+both paths share it by construction rather than by discipline. Confirmed a
+mixed-case request now scores identically, and added that as an assertion in
+both the unit tests and the smoke test.
+
+**That fix then exposed a genuine deployment bug, via a test failure that looked
+like a fixture problem.** `PicklingError: Can't pickle normalise_text`. SageMaker
+script mode runs the training entry point as `__main__`, so a transform function
+defined in `train.py` pickles as `__main__.normalise_text` — a name that does not
+resolve in the inference container, where `inference.py` is the entry point. The
+model would have trained successfully and failed to load.
+
+Extracted the contract and the cleaning into `ml/features.py`, imported by both,
+so the reference resolves either way, and added it to the training archive.
+**Verified against the real path** rather than trusting the unit tests: trained
+by running `train.py` as `__main__`, then loaded the artifact from a separate
+process through `inference.py`. It scores, and the pickle references `features`
+rather than `__main__`.
+
+Also added a `predict_required_fields` output so the smoke test fails with one
+clear message when it falls behind, rather than three confusing 400s.
+
+**Verification run:** 247 tests pass; all five pre-commit hooks pass; README
+anchors and links resolve.
+
+**Notes**
+
+Accepted as-is. `make apply` then `make model` are needed — the deployed model
+predates the normalisation fix, so until it is retrained the endpoint still
+mishandles mixed-case input.
+
+---
+
+### 037 — Why first-pass failures keep happening
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `scripts/{run_etl,verify}.sh`, `README.md`, `TODO.md`
+
+**Prompt**
+
+```text
+these errors keep happening on the first pass. is there a step we are missing?
+or something thats configured incorrectly [smoke test now fully passing]
+```
+
+**Output**
+
+The smoke test passes, including the mixed-case check that proves the skew fix
+reached the endpoint.
+
+Answered the question by categorising all fourteen failures that reached a real
+apply or run this session, rather than generalising:
+
+| Cause | Count |
+|---|---|
+| AWS API behaviour only knowable by calling AWS | 5 |
+| My logic errors | 2 |
+| Drift between duplicated definitions | 2 |
+| Design gaps | 2 |
+| Terraform semantics, runtime shape, stale artefact | 3 |
+
+**Eight of fourteen were catchable locally in principle.** That is the honest
+answer: nothing is misconfigured, but the first apply has been serving as the
+first integration test, and roughly half of what it caught did not need AWS to
+find. Each one produced a test afterwards, which is why the suite went from 96
+to 247 — but reactively, one class at a time.
+
+**One systemic gap was still open, and closing it was the concrete "missing
+step".** Nothing verified that what is deployed matches the working tree. Editing
+the job script and running the job without applying executes the *previous*
+version, and the symptom appears later and elsewhere — which is exactly what the
+stale-processed-schema failure was. `run_etl.sh` now compares the deployed script
+against the local one and refuses, and `verify.sh` reports it.
+
+Added a **"Why a first apply often fails"** section to the README stating plainly
+what cannot be validated without AWS, what each guard does catch, and the
+ordering trap: a transform change must propagate through job script, Parquet,
+catalog, external table, landing table, views, model and API contract in that
+order, and fixing one link at a time produces a run of unrelated-looking errors.
+
+**Verification run:** 247 tests pass; all five pre-commit hooks pass; README
+anchors resolve.
+
+**Notes**
+
+Accepted as-is. Two of the five AWS-behaviour failures were ones I had flagged
+uncertainty about and then defaulted to the riskier setting anyway — network
+isolation and enhanced VPC routing. That is not a tooling gap; the rule taken
+from it is that flagged uncertainty should default to off.
+
+---
+
+### 038 — `make data` or `make rebuild` on a clean account
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `scripts/land_sample_data.sh`, `Makefile`, `README.md`
+
+**Prompt**
+
+```text
+after runing make apply, on a clean aws account, shouw i run make rebuild or
+make data?
+```
+
+**Output**
+
+`make data`. Traced both rather than answering from memory: `rebuild` adds a
+catalog delete and a `DROP TABLE IF EXISTS`, and both are no-ops on a clean
+account — so it would work, but it is the wrong tool. It exists for when a
+transform change has left artefacts written by an older version of the job.
+
+**Checking the answer turned up a small real problem.** `make data` starts with
+`make land`, and `terraform apply` now seeds that same object. Landing it again
+with `aws s3 cp` replaces a Terraform-managed object and drops the tags
+Terraform set, which would show as drift on the next plan. `land` now compares
+content hashes and skips when they already match, so the seeded object is left
+alone.
+
+That the question needed asking at all was the signal that the target help was
+unclear, so both were rewritten: `data` now reads "run the data path on a fresh
+environment — start here after `make deploy`", and `rebuild` "re-run everything
+after a *transform change*". The README says the same in the pipeline section,
+and the quick start is now labelled as the whole clean-account path in order.
+
+**Verification run:** 247 tests pass; all five pre-commit hooks pass.
+
+**Notes**
+
+Accepted as-is. A question about which command to run is usually a documentation
+defect rather than a user error, and in this case it also surfaced a drift bug.
+
+---
+
+### 039 — Smoke test labels described the wrong thing
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `scripts/smoke_test_endpoint.sh`, `tests/test_train.py`, `README.md`
+
+**Prompt**
+
+```text
+if this is a passing smoke test then the descriptions are misleading. also, it
+is not returning the result of the api endpoint being called
+```
+
+**Output**
+
+Both correct, and both real.
+
+**The labels described inputs, not expectations,** so a reader could not tell
+whether a `400` was the point or the problem. Rewritten as statements of
+behaviour — "rejects an empty instances list" rather than "empty instances" —
+so `ok` reads as "it did that".
+
+**One label was outright wrong.** `"missing required field"` sent
+`{"region":"emea"}`, which omits seven. Split into two cases: an otherwise
+complete order with exactly one field removed, which is the realistic mistake
+and now genuinely matches its label, and a separate almost-empty payload.
+
+**Two checks discarded the response.** The mixed-case comparison sent both
+requests to `/dev/null` and printed only a verdict, and the API-key check used
+`curl -o /dev/null`, so neither showed what came back. Both now print the
+bodies — the mixed-case one prints both, so "identical" is verifiable rather
+than asserted.
+
+**Checking this exposed a hole in a test I wrote two entries ago.** The drift
+test matches inline `{"instances":[{...}]}` blocks, but refactoring the smoke
+payloads into `ORDER=` and `OTHER=` variables moved them outside that pattern —
+so the test written to prevent staleness could no longer see the payload most
+likely to go stale. Extended it to read the shell assignments, and confirmed it
+fails when `$ORDER` alone is broken.
+
+**Verification run:** 247 tests pass; all five pre-commit hooks pass. Nothing was
+run against AWS.
+
+**Notes**
+
+Accepted as-is. Third time a fix has been applied narrowly enough to leave the
+same class open elsewhere: the drift test covered the README, then the smoke
+test, and needed extending again the moment that file was refactored.
+
+---
+
+### 040 — An unmissable verdict
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `scripts/{smoke_test_endpoint,verify}.sh`, `tests/test_scripts.py`
+
+**Prompt**
+
+```text
+add a clear indication that the user can understand this was successful
+```
+
+**Output**
+
+Both scripts ended on a single unstyled line — `all checks passed` for the smoke
+test, a bold count for `verify` — easy to lose under a screen of JSON, which is
+exactly where the answer matters most.
+
+Both now close on a bounded, coloured verdict stating the count and what it
+means:
+
+```
+────────────────────────────────────────────────────────────────
+  PASSED — 9 of 9 checks
+
+  The public endpoint is live and serving predictions.
+  Reachable from outside AWS, over HTTPS, with an API key:
+    https://…/dev/predict
+────────────────────────────────────────────────────────────────
+```
+
+The failure form is equally prominent, goes to stderr, and says where to look —
+for the smoke test, that a 5xx implicates the endpoint or proxy while a wrong
+4xx implicates the request contract; for `verify`, that the list should be
+worked in order because a stale deployment or missing schema makes everything
+after it fail too.
+
+Required adding pass counters: the smoke test only tracked a failure flag, so it
+could not say "9 of 9". Both hand-rolled checks — mixed case and the API key —
+had to be counted alongside those going through `check()`, or the total would
+have quietly under-reported.
+
+Rendered both outcomes before finishing, rather than assuming the escape codes
+and the `printf` formats were right.
+
+Added three tests covering both scripts: each states a verdict for success *and*
+failure, each reports a count, and each exits non-zero when it fails. That last
+one matters most — a script that prints "FAILED" and exits 0 would pass in
+`make`.
+
+**Verification run:** 253 tests pass; all five pre-commit hooks pass.
+
+**Notes**
+
+Accepted as-is.
