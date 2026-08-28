@@ -170,8 +170,19 @@ class TestOrdersSpec:
             "dd-MMM-yyyy",
         }
 
-    def test_price_is_decimal_not_float(self, orders_spec):
-        assert _columns(orders_spec)["unit_price_usd"]["type"] == "decimal(12,2)"
+    def test_price_is_double_so_a_missing_value_can_be_nan(self, orders_spec):
+        """Deliberate trade. decimal is the right type for money, but it cannot
+        represent NaN, and an absent price is required to be NaN. Exactness on
+        monetary sums is given up for that."""
+        price = _columns(orders_spec)["unit_price_usd"]
+        assert price["type"] == "double"
+        assert price["missing"] == "nan"
+
+    def test_nan_defaults_only_on_types_that_can_hold_one(self, job):
+        for name, spec in _all_specs(job):
+            for column in spec["columns"]:
+                if column.get("missing") == "nan":
+                    assert column["type"] in ("double", "float"), f"{name}:{column['name']}"
 
     def test_shipping_days_is_optional(self, orders_spec):
         # One row in the source file has no value; it must not be a reject.

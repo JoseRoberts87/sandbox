@@ -44,12 +44,12 @@ def view_select_list():
 def frame(train):
     """A small but valid training frame: both classes, one null to impute."""
     rows = [
-        ("ORD-1", "EMEA", "retail", "puzzles", 1, 10.0, 0.00, 1, 0),
-        ("ORD-2", "EMEA", "online", "puzzles", 2, 20.0, 0.10, 2, 1),
-        ("ORD-3", "APAC", "retail", "digital", 1, 15.0, 0.00, 3, 0),
-        ("ORD-4", "APAC", "partner", "digital", 4, 40.0, 0.25, 4, 1),
-        ("ORD-5", "LATAM", "retail", "puzzles", 1, 12.0, 0.00, 5, 0),
-        ("ORD-6", None, "wholesale", "digital", 3, 30.0, 0.05, 6, 1),
+        ("ord-1", "emea", "retail", "puzzles", 1, 10.0, 0.00, 3, 1, 0),
+        ("ord-2", "emea", "online", "puzzles", 2, 20.0, 0.10, 9, 2, 1),
+        ("ord-3", "apac", "retail", "digital", 1, 15.0, 0.00, 2, 3, 0),
+        ("ord-4", "apac", "partner", "digital", 4, 40.0, 0.25, 14, 4, 1),
+        ("ord-5", "latam", "retail", "puzzles", 1, 12.0, 0.00, 4, 5, 0),
+        ("ord-6", None, "wholesale", "digital", 3, 30.0, 0.05, 11, 6, 1),
     ]
     columns = train.ID_COLUMNS + train.FEATURES + [train.TARGET]
     return pd.DataFrame(rows, columns=columns)
@@ -75,6 +75,21 @@ class TestFeatureContract:
         declared = re.findall(r'"([a-z_]+)"', block.group(1))
         assert declared == train.FEATURES
 
+    def test_readme_example_carries_every_required_field(self, train):
+        """The contract lives in four places: the training view, this script,
+        the Terraform-declared API contract, and the README's worked example.
+        The first three had drift tests; the example did not, and went stale —
+        it would have returned 400 for a missing field."""
+        readme = (ROOT / "README.md").read_text()
+        payloads = re.findall(r'\{"instances":\s*\[\{(.*?)\}\]', readme, re.S)
+        assert payloads, "no example request found in the README"
+
+        for payload in payloads:
+            fields = set(re.findall(r'"([a-z_]+)":', payload))
+            assert set(train.FEATURES) <= fields, (
+                f"README example is missing {sorted(set(train.FEATURES) - fields)}"
+            )
+
     def test_no_feature_is_listed_twice(self, train):
         assert len(train.FEATURES) == len(set(train.FEATURES))
         assert not set(train.CATEGORICAL_FEATURES) & set(train.NUMERIC_FEATURES)
@@ -82,7 +97,6 @@ class TestFeatureContract:
     @pytest.mark.parametrize(
         "column,reason",
         [
-            ("shipping_days", "known only after shipping; unavailable at scoring time"),
             ("order_status", "the label"),
             ("net_amount_usd", "derived from discount_pct, already a feature"),
             ("etl_job_run_id", "pipeline metadata"),
@@ -91,6 +105,13 @@ class TestFeatureContract:
     def test_leaking_columns_are_absent(self, train, column, reason):
         assert column not in train.FEATURES, reason
         assert column not in view_select_list(), reason
+
+    def test_shipping_days_is_a_feature_not_leakage(self, train):
+        """TR-15. It reads like leakage and is not: the column is populated on
+        pending orders, which have not shipped, and cancelled ones, which never
+        will — so it is an estimate available when the order is placed."""
+        assert "shipping_days" in train.FEATURES
+        assert "shipping_days" in view_select_list()
 
     def test_the_label_is_not_also_a_feature(self, train):
         assert train.TARGET not in train.FEATURES
@@ -122,8 +143,9 @@ class TestPipeline:
         pipeline.fit(frame[train.FEATURES], frame[train.TARGET])
 
         unseen = pd.DataFrame(
-            [{"region": "ANTARCTICA", "channel": "carrier-pigeon", "category": "unheard-of",
-              "quantity": 1, "unit_price_usd": 9.99, "discount_pct": 0.0, "order_dow": 0}]
+            [{"region": "antarctica", "channel": "carrier-pigeon", "category": "unheard-of",
+              "quantity": 1, "unit_price_usd": 9.99, "discount_pct": 0.0,
+              "shipping_days": 7, "order_dow": 0}]
         )
         probability = pipeline.predict_proba(unseen)[0][1]
         assert 0.0 <= probability <= 1.0

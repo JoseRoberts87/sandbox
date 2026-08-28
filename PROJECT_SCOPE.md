@@ -262,6 +262,11 @@ land in CloudWatch. Needs a policy decision: does a failed rule **stop** the loa
 Proposal: fail closed on schema/uniqueness/null-key violations, warn on
 distribution drift.
 
+**Extended again (2026-08-27).** The transform now also rejects exact duplicate
+rows, malformed identifiers, values outside a closed set for every dimension,
+and future-dated orders. Missing integers become NULL and missing floats become
+NaN rather than being rejected — absent is not invalid.
+
 **Extended (2026-08-26).** Three tiers, not one:
 
 - **Structural problems fail the run immediately** — a missing column, an unreadable path, an empty partition. These mean the file is not what we think it is, and loading any of it would be wrong.
@@ -336,7 +341,7 @@ training and inference use the identical code path. **Depends on Q-02/Q-03.**
 
 `ml.orders_training` (SQL, reviewable in a diff) chooses the rows, defines the label, and excludes leakage. The model artifact is a single sklearn `Pipeline` containing imputation, encoding, scaling *and* the classifier — so inference physically cannot apply different preprocessing from training, because there is one object and one code path. Splitting them is how training/serving skew happens, and it looks fine offline.
 
-Leakage exclusions are documented in the view rather than inferred: `shipping_days` is unknown at scoring time; `pending` orders are excluded because they have not resolved, and at scoring time every new order is pending; the hour of `order_ts` is excluded because 7 of 19 source rows carry a date with no time, so hour would encode which timestamp format the row arrived in — a property of our ETL, not of the order.
+Leakage exclusions are documented in the view rather than inferred. `shipping_days` was among them and **is no longer** (TR-15): it is populated on `pending` orders, which have not shipped, and on `cancelled` ones, which never will, so it is an estimate available when the order is placed rather than an observed outcome. Excluding it was discarding a legitimate feature. Still excluded: `pending` orders are excluded because they have not resolved, and at scoring time every new order is pending; the hour of `order_ts` is excluded because a substantial share of source rows carry a date with no time, so hour would encode which timestamp format the row arrived in — a property of our ETL, not of the order.
 
 **D-28 — Training approach.** SageMaker built-in algorithm, script mode in a
 managed container, or a custom container?
@@ -396,8 +401,10 @@ the swap is worth deciding explicitly rather than by accident.
 
 **Decided (2026-08-27).** Two separate acts:
 
-1. **Approve** — `scripts/promote_model.sh` marks a registry version fit to serve. This deploys nothing.
-2. **Serve** — set `approved_model_package_arn` in `terraform.tfvars` and apply.
+1. **Approve** — `scripts/promote_model.sh` marks a registry version fit to serve, and writes its ARN into `terraform.tfvars`. This deploys nothing.
+2. **Serve** — review the resulting diff and apply.
+
+*Revised 2026-08-27:* step 1 originally required editing `terraform.tfvars` by hand. The script now writes it. The property D-31 exists to protect is unchanged — the served version lives in version control and reaches the endpoint only through a reviewed diff and a manual apply — and what is given up, a person typing an ARN, was never the safeguard. It was a source of error: a truncated or stale ARN deploys the wrong model and looks exactly like the right one. The script prints the diff it made, and refuses rather than appending if the assignment is missing.
 
 So the deployed model version lives in version control and changes only through a reviewed diff, which is what D-07 asks for. A retrain never needs an apply; a *promotion* deliberately does.
 
@@ -473,6 +480,8 @@ directory applied manually is the usual answer).
 
 **Decided for Redshift DDL (2026-08-27):** ordered, re-runnable files in `sql/migrations/`, applied by `scripts/redshift_sql.sh` through the Data API. Terraform does not run them — it owns infrastructure, not schema. Placeholders are filled from terraform outputs, and a file naming one with no value fails rather than substituting an empty string.
 
+**Migrations are additive and re-runnable; destructive one-offs are not migrations.** Every statement in `sql/migrations/` is `CREATE ... IF NOT EXISTS` or `CREATE OR REPLACE`, so the directory can be applied repeatedly. A rebuild cannot live there: placed at the end it runs *after* the views that depend on the schema it is meant to repair, and placed anywhere it would drop data on every routine run. Those live in `sql/` and are invoked deliberately — `sql/rebuild_landing_orders.sql`, `sql/load_orders.sql`, `sql/unload_training_set.sql`. `tests/test_sql.py` enforces the split.
+
 **D-39 — Cost guardrails.** An AWS Budget with an alarm at a threshold set from
 Q-07, S3 lifecycle rules, Redshift Serverless auto-pause, Serverless Inference,
 and a documented teardown procedure for the dev environment.
@@ -491,7 +500,7 @@ These block specific decisions. They are about the problem, not the technology.
 
 | ID | Question | Blocks |
 |---|---|---|
-| Q-01 | ~~What format does the data arrive in?~~ **Partially answered:** CSV with header, 13 columns, profiled in [docs/dataset-takehome-orders.md](./docs/dataset-takehome-orders.md). Still open: what system produces it, and how it will reach S3 in future (manual upload for now) | D-15, D-18 |
+| Q-01 | ~~What format does the data arrive in?~~ **Partially answered:** CSV with header, schema profiled in [docs/dataset-takehome-orders.md](./docs/dataset-takehome-orders.md). Still open: what system produces it, and how it will reach S3 in future (manual upload for now) | D-15, D-18 |
 | Q-02 | ~~What is the ML problem?~~ **Answered (2026-08-27):** binary classification — will an order end up refunded, from information available when it is placed. Defined in `sql/migrations/005_ml_training_view.sql` | D-27, D-28 |
 | Q-03 | ~~Latency requirements?~~ **Answered (2026-08-27):** a cold start of several seconds is acceptable, so Serverless Inference | D-27, D-29 |
 | Q-04 | ~~Who calls the endpoint?~~ **Answered (2026-08-27):** consumers outside AWS, so API Gateway with an API key and quota | D-30 |
@@ -575,3 +584,4 @@ need a second load to observe at all: that a repeated load does not double rows
 | 2026-08-27 | Endpoint creation failed: network isolation is not supported on Serverless Inference. Default flipped to false; D-29 amended with what serverless gives up. |
 | 2026-08-27 | Endpoint reached InService. API Gateway stage needed an account-level CloudWatch Logs role — added, with the account-wide blast radius recorded (T-5.15). |
 | 2026-08-27 | **Pipeline runs end to end**: raw CSV → Glue → Parquet → Redshift → training → registry → endpoint → public API. Smoke test green. Fixed an information leak found by it: SageMaker's `ModelError` wrapper carries the account id and a console URL, and the proxy was passing it to callers. |
+| 2026-08-27 | Transform substantially revised: `order_ts` stored as a UTC epoch, all text lowercased, money moved to `double` so a missing price can be NaN, missing integers to NULL, exact duplicate rows rejected, closed sets and format patterns on every identifier, and eight derived columns added. `shipping_days` reclassified from leakage to feature. Warehouse schema rebuilt to match. |

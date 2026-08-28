@@ -61,8 +61,9 @@ redshift_enhanced_vpc_routing = false
 # --- inference (phase 5) ---
 # Empty until a model version is approved. Setting this ARN is the promotion
 # step (D-31) and creates the endpoint, the Lambda proxy and the public API;
-# clearing it removes them. scripts/promote_model.sh prints the line to paste.
-approved_model_package_arn = "arn:aws:sagemaker:us-east-1:823878989845:model-package/sandbox-dev-orders-refund-risk/1"
+# clearing it removes them. `make promote` writes this line for you on approval;
+# it still takes a reviewed diff and a manual apply to reach the endpoint.
+approved_model_package_arn = "arn:aws:sagemaker:us-east-1:823878989845:model-package/sandbox-dev-orders-refund-risk/2"
 endpoint_memory_mb         = 2048
 endpoint_max_concurrency   = 5
 

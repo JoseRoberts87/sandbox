@@ -1801,3 +1801,383 @@ Accepted as-is. The highest-value remaining item is not a feature: phase 6 has
 not started, so a fully deployed environment has no budget alarm and no failure
 alerting. The Redshift usage limit is the only automatic guard and it covers one
 service.
+
+---
+
+### 029 — Proposed transformations, and removing row counts
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `docs/proposed-transformations.md` (new), `docs/dataset-takehome-orders.md`, `tests/test_transform.py`, `README.md`, `PROJECT_SCOPE.md`, `TODO.md`, `sql/migrations/005_ml_training_view.sql`, `scripts/run_etl.sh`
+
+**Prompt**
+
+```text
+where is the list of transformations? and there should be no mentions of row
+counts anywhere as the row counts may vary
+```
+
+**Output**
+
+Two corrections, both fair. The previous reply mixed findings with
+recommendations instead of producing a list, and row counts were scattered
+through the docs from when the sample file was tiny.
+
+**The row-count problem was not only prose — two tests were failing.**
+`test_transform.py` asserted `evaluated.count() == 19` and an exact set of
+dimension values, both of which broke when the source file was replaced with a
+much larger one. Rewrote them to assert *properties* instead: no row is silently
+dropped, every reject carries a non-empty reason, the reject rate is not
+wholesale, and cleaned dimension values are subsets of the canonical set with
+every value already normalised. Those hold whatever the file contains.
+
+Removed counts from `README.md`, `PROJECT_SCOPE.md`,
+`005_ml_training_view.sql`, `run_etl.sh` and throughout the dataset doc, and
+restated the dataset doc in terms of properties, with a note at the top saying
+explicitly that nothing depends on file size.
+
+Two claims in that doc were not merely stale but **wrong** against the current
+file, and were corrected rather than reworded: `order_id` is no longer unique,
+and slash-format dates are no longer unambiguous — the note that said "no
+slash-format date is ambiguous ... which is the only reason month-first parsing
+is safe" now says the opposite, because the condition it depended on has failed.
+The SKU note was also wrong in kind: it described one conflicting SKU, where in
+fact effectively every SKU maps to many products and categories, which makes the
+column useless as a key rather than merely untidy.
+
+**Wrote `docs/proposed-transformations.md`** — 16 candidates with stable
+`TR-##` ids, an index table with an empty Decision column, a detail block per
+item (column, current behaviour, problem, proposal, decision), and an empty
+section for the reviewer to append to. Verified every id in the table has a
+detail block and vice versa. Cross-linked from the README, the dataset doc and
+`TODO.md` (T-2.19) so it is not a stray file.
+
+Nothing was implemented — the request was for a list to review.
+
+**Verification run:** 202 tests pass, including the two rewritten ones; all five
+pre-commit hooks pass; no row counts remain outside this log; all relative links
+resolve.
+
+**Notes**
+
+Accepted as-is. Worth recording that the tests hardcoding a row count is the
+same failure as the docs doing it — an assertion tied to the size of a sample
+rather than to a property that should hold. The rewritten ones would have
+survived the file being replaced.
+
+---
+
+### 030 — Transformations approved and implemented
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `glue/jobs/raw_to_processed.py`, `sql/` (003, 005, 006, load), `ml/train.py`, `envs/dev/variables.tf`, `tests/{test_transform,test_spec,test_train,test_inference,test_predict_lambda}.py`, `docs/{proposed-transformations,dataset-takehome-orders}.md`, `PROJECT_SCOPE.md`, `TODO.md`
+
+**Prompt**
+
+```text
+i approve your recommendations. additionally lets make sure we are standardizing
+the order_ts to a valid linux epoch [...] remove leading and training whitespaces
+[...] default any missing integer in shipping_days and quantity to a null.
+default any missing float in unit_price_usd and discount_pct to NaN. reject
+duplicate rows where all fields match. lower case all text. Clean unit_price_usd
+removing the `$` symbol
+```
+
+**Output**
+
+Implemented TR-01–TR-15 and all seven additions. Two of the additions were
+already in place (trimming, `$` stripping) and were verified rather than
+rebuilt.
+
+**The cleaning rules collapsed from five to three.** "Lower case all text" makes
+`code`, `enum` and `text` identical, so they became one `text` rule. Identifiers
+are lowercased too.
+
+**Two conflicts that needed resolving rather than implementing literally:**
+
+1. **NaN and `decimal` are mutually exclusive.** Decimal types cannot represent
+   NaN, so `unit_price_usd` moved from `decimal(12,2)` to `double`. That trades
+   exactness on monetary sums, and the test asserting decimal was rewritten to
+   state the trade rather than deleted.
+2. **NaN poisons arithmetic in a way NULL does not** — a real bug I introduced
+   and then caught: `coalesce` handles NULL but not NaN, so one absent discount
+   turned every derived amount on that row into NaN. Fixed with `nanvl`, and
+   verified across four cases. An absent *price* is deliberately left to
+   propagate: an amount computed from an unknown price is genuinely unknown.
+
+**Exact-duplicate rejection is separate from key deduplication**, and ordered
+before it. A row identical in every field needs no adjudication; a repeated key
+with differing values is a genuine conflict, and one reason should not mask the
+other. On the current file this turned out to matter for classification rather
+than count — every repeated `order_id` proved to be a full-row duplicate, so
+there are no real key conflicts at all.
+
+**Ran the new spec against the real file before touching anything downstream.**
+The reject rate fell from 4.5% to 3.45% (TR-05 stopped discarding orders with an
+unknown customer), and the remaining rejects are negative quantities and exact
+duplicates. Verified epoch round-trips, midnight for date-only values, region
+mapping, lowercasing, NULL/NaN defaults, the derived amounts and
+`customer_order_seq`.
+
+**Downstream:** `landing.orders` needed `order_ts BIGINT`, `DOUBLE PRECISION`
+money, nullable `customer_id` and `quantity`, and eight new columns. Since
+`CREATE TABLE IF NOT EXISTS` cannot alter an existing table, added
+`006_rebuild_landing_orders.sql` — a one-time drop and rebuild, safe because the
+table is a copy of the processed zone. It necessarily duplicates 003–005, which
+is tracked for deletion as T-3.15.
+
+**TR-15 changed the model**: `shipping_days` added to the training view,
+`FEATURES`, and the Terraform-declared API contract — the existing drift test
+confirmed all three agree.
+
+**Two items were deliberately not implemented.** TR-16 (the ambiguous date
+convention) and TR-08 (the digital-shipping rule) both need an answer from
+whoever owns the feed. Adding a rule to TR-08 before the column's meaning is
+settled would encode a guess as a constraint.
+
+**Verification run:** 211 tests pass. Sixteen failed initially, all from the
+deliberate changes; several fixtures broke on the new identifier patterns, and
+four tests that named specific rows from the old file were rewritten to assert
+properties instead. All five pre-commit hooks pass.
+
+**Notes**
+
+Accepted as-is, unapplied. Deploying needs `make apply` (new job script), then
+`make migrate` for the rebuild migration, then `make etl load` — the warehouse
+must be reloaded because the processed schema changed. `--max_reject_pct` should
+be re-derived now that the rate has moved (T-2.20).
+
+---
+
+### 031 — Migration ordering: a rebuild cannot follow its dependents
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `sql/rebuild_landing_orders.sql` (new, replacing `sql/migrations/006_*`), `Makefile`, `tests/test_sql.py` (new), `README.md`, `PROJECT_SCOPE.md`, `TODO.md`
+
+**Prompt**
+
+```text
+{"Error": "Query #1 failed with ERROR: column \"order_dow\" does not exist in orders",
+ "Sql": "CREATE OR REPLACE VIEW ml.orders_training AS ... order_dow ..."}
+```
+
+**Output**
+
+My ordering error, from the previous entry. The rebuild was numbered `006`, but
+`005` builds a view over the columns the rebuild creates — so `005` ran first and
+failed, and `006` was never reached. **A rebuild cannot sit after the
+definitions that depend on it.** The previous entry noted the file "duplicates
+003–005 by necessity ... because migrations are ordered"; the necessity was the
+signal that it did not belong in the sequence at all.
+
+**Fix: moved it out of `sql/migrations/` entirely**, to
+`sql/rebuild_landing_orders.sql`, alongside `load_orders.sql` and
+`unload_training_set.sql` — the existing convention for operations run
+deliberately rather than as part of a re-runnable sequence.
+
+That also removed the duplication rather than merely tracking it. The file is now
+a single `DROP TABLE ... CASCADE`: the migrations recreate the table and both
+views from their own definitions, so there is no second copy of the DDL to keep
+in step. Added `make rebuild`, which drops, re-migrates and reloads in order.
+
+Leaving it in the sequence had a second problem worth stating: a `DROP` that runs
+on every `make migrate` would silently empty the warehouse on a routine
+re-application.
+
+**Added `tests/test_sql.py`** (27 tests) encoding the rule and several
+neighbouring ones: migrations are numbered and contiguous; **no migration
+contains a `DROP`**; every migration statement is `IF NOT EXISTS` or
+`OR REPLACE` so the directory can be re-applied; every `${placeholder}` is one
+the runner can actually supply; the `INSERT` column list matches the table
+definition exactly; and the training view reads `analytics.orders` rather than
+the history table.
+
+**Verified the two most valuable of those fail on the real bugs** — restoring a
+`DROP` migration fails the ordering test, and dropping a column from the load's
+list fails the agreement test — then restored both.
+
+**Verification run:** 238 tests pass; all five pre-commit hooks pass. Nothing was
+run against AWS.
+
+**Notes**
+
+Accepted as-is. Recovery is `make rebuild`. The partially-applied state is
+harmless: 003 and 004 succeeded as no-ops against the old schema, and the drop
+clears all of it.
+
+---
+
+### 032 — The rebuild rebuilt the warehouse but not the data it reads
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `Makefile`, `scripts/{load_warehouse,reset_catalog_table}.sh`, `README.md`, `PROJECT_SCOPE.md`, `TODO.md`
+
+**Prompt**
+
+```text
+{"Error": "Query #2 failed with ERROR: column \"order_year\" does not exist in
+ takehome_orders", ... "INSERT INTO landing.orders ... FROM processed_ext.takehome_orders"}
+```
+
+**Output**
+
+The previous fix was incomplete. `make rebuild` dropped and rebuilt
+`landing.orders` correctly — the error has moved from `orders` to
+`takehome_orders`, the *external* table — but the processed Parquet in S3 was
+still written by the old job, so the columns the load wants do not exist there
+yet. The warehouse was rebuilt; the data it reads was not.
+
+Three changes:
+
+**`make rebuild` now runs the whole chain in order** — reset the catalog, re-run
+the ETL, drop, migrate, load — and prints a reminder that `make apply` must come
+first if the job script changed, since otherwise the ETL rewrites the old shape.
+
+**`make load` now checks before it starts.** It reads `svv_external_columns`,
+compares against the column list parsed out of `load_orders.sql`, and reports
+every missing column at once with the fix, instead of Redshift naming one at a
+time across successive failed runs. Verified the logic against a simulated old
+schema — it names exactly the eight new columns — and against the current one,
+where it reports nothing.
+
+**Added `scripts/reset_catalog_table.sh` and `make reset-catalog`,** for a risk
+that had not surfaced yet but would have been worse than this failure. The Glue
+sink adds columns to the catalog reliably; changing a column's *type* is less
+dependable, and this change altered two — `order_ts` to an epoch and
+`unit_price_usd` to a double. A stale catalog type is not an error but a silent
+misread: an epoch interpreted as a timestamp is garbage that loads cleanly.
+Deleting the table forces the next run to recreate it from the data. It removes
+metadata only.
+
+That risk exists because the processed catalog table is still sink-managed
+rather than declared in Terraform — the temporary state T-2.10 already tracks.
+Recorded as a concrete consequence in the scope and as T-2.21.
+
+**Verification run:** 242 tests pass; all five pre-commit hooks pass. Nothing was
+run against AWS.
+
+**Notes**
+
+Accepted as-is. Recovery is `make apply` then `make rebuild`. Two failures in a
+row came from the same root: a schema change has to propagate through catalog,
+Parquet, table and views in order, and I fixed one link at a time instead of
+tracing the chain.
+
+---
+
+### 033 — README audit
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `README.md`, `tests/test_train.py`
+
+**Prompt**
+
+```text
+is the readme up to date?
+```
+
+**Output**
+
+No, in three places. Audited it against the code rather than reading it over.
+
+**The worked `curl` example was broken.** It omitted `shipping_days`, which
+TR-15 made a required field, so anyone copying it would have got a 400. A stale
+example is the worst kind of documentation rot: it looks authoritative and fails
+on first use.
+
+**A stale metric and row count** — "on 19 sample rows this scores an ROC AUC
+around 0.54" survived the earlier sweep for counts, and both halves were wrong
+after the dataset was replaced. Rewritten to describe what the training script
+reports rather than quoting a number that goes out of date on the next run.
+
+**The transform section predated the revision**, still describing the job in
+terms that no longer matched: no mention of epoch timestamps, lowercasing, or
+the NULL/NaN defaults. Replaced with a short summary of what actually happens to
+a row, pointing at the dataset doc for the full contract.
+
+**Added a drift test for the example.** The feature contract spans four places —
+the training view, `train.py`, the Terraform-declared API contract, and the
+README's example. The first three had drift tests, which is why they stayed in
+step; the example had none, which is why it did not. The test parses the
+README's payload and asserts it carries every feature. Confirmed it fails when
+the field is removed again.
+
+**Then audited the rest mechanically** rather than by eye: internal anchors,
+relative file links, every script and SQL file named, every make target
+documented, and residual hard numbers. All clean; the two numeric hits are the
+Terraform version pin and a task id.
+
+**Verification run:** 243 tests pass; all five pre-commit hooks pass.
+
+**Notes**
+
+Accepted as-is. The pattern is worth noting: every part of the feature contract
+with a test stayed correct, and the one part without a test went stale within a
+turn of being written. Documentation that can be checked mechanically should be.
+
+---
+
+### 034 — `make promote` records the approved ARN
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `scripts/promote_model.sh`, `envs/dev/terraform.tfvars`, `Makefile`, `tests/test_scripts.py`, `README.md`, `PROJECT_SCOPE.md`
+
+**Prompt**
+
+```text
+when runnin make model. if the user selects to approve the model, update the
+variable in terraform.tfvars
+```
+
+**Output**
+
+Implemented, and **revised D-31 rather than leaving the decision contradicting
+the code**. D-31 had recorded the hand-edit as part of the design: "promotion
+means editing terraform.tfvars by hand, so the deployed version stays a reviewed
+diff".
+
+The property that decision protects is unchanged. The served version still lives
+in version control and still reaches the endpoint only through a reviewed diff
+and a manual apply. What is given up — a person typing an ARN — was never the
+safeguard; it was a source of error, since a truncated or stale ARN deploys the
+wrong model and looks exactly like the right one. Recorded as a dated revision
+with that reasoning.
+
+On approval the script rewrites the assignment with `sed`, using `|` as the
+delimiter because an ARN contains slashes but never a pipe, then prints
+`git diff` of the file so the change is visible before `make plan`. It refuses
+rather than appending if the assignment is absent, since guessing where to put
+it in a config file is worse than stopping.
+
+**A first attempt broke on nested heredocs** — embedding a Python heredoc
+terminated by `PY` inside another one closed the outer early. Checked that
+`promote_model.sh` was undamaged before retrying, then dropped the embedded
+Python for `sed`, which needs no nesting.
+
+**Tested the edit on copies rather than the real file**, across the cases that
+could corrupt it: an empty existing value, a populated one, a file with no such
+assignment, and a check that the result parses back. Replacing an ARN changes
+that line and nothing else — same line count, zero other differences — and the
+missing-assignment case refuses instead of appending.
+
+Added a test pinning the shape of the assignment, since the script's `sed`
+pattern depends on it and a reformat would turn a promotion into a refusal.
+
+**Verification run:** 244 tests pass; all five pre-commit hooks pass. Nothing was
+run against AWS.
+
+**Notes**
+
+Accepted as-is. `make model` still stops after approval by design — it records
+the ARN, it does not apply.

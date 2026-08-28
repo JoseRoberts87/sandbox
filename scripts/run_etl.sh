@@ -32,7 +32,7 @@ RUN_ID=$(aws glue start-job-run --job-name "$JOB" "${ARGS[@]}" --query JobRunId 
 echo "run: $RUN_ID"
 
 # Glue has no waiter for job runs, so poll. Runs here take a couple of minutes;
-# most of that is Spark starting up rather than processing 19 rows.
+# most of that is Spark starting up rather than the transform itself.
 POLL_ERRORS=0
 
 while true; do

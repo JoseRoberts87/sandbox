@@ -91,6 +91,11 @@ decisions deferred along the way.
 - [ ] **T-2.15** Query the processed table in Athena as an independent check on the catalog
 - [ ] **T-2.10** Declare the processed table in Terraform and set `--update_catalog=false` (D-16). The explicit read schema half is **done** — `takehome/orders` declares its types in the job; `inferSchema` is now only a fallback for unspec'd datasets. Do the Terraform half after T-2.12 confirms the written schema
 - [ ] **T-2.18** Decide whether processed should partition on `order_date` instead of `ingest_date` (D-12). Snapshot partitions repeat the whole dataset per run; settle before the phase 3 COPY, since it changes what Redshift reads
+- [x] **T-2.19** TR-01–TR-15 implemented, plus seven review additions (epoch `order_ts`, trim everywhere, NULL for missing ints, NaN for missing floats, exact-duplicate rejection, lowercase all text, `$` stripping). TR-08 and TR-16 stay open — both need the source
+- [ ] **T-3.15** Delete `sql/rebuild_landing_orders.sql` once every environment has run it
+- [ ] **T-2.21** The processed catalog table is still written by the Glue sink (T-2.10). Until it is declared in Terraform, a column *type* change needs `make reset-catalog` — the sink adds columns reliably but changes types less so, and a stale type is a silent misread rather than an error
+- [ ] **T-2.20** Re-derive `--max_reject_pct` (TR-09). The rate has moved with these changes; the current 5% was chosen before any real data existed
+- [ ] ~~T-2.19 placeholder~~
 - [ ] **T-2.16** Confirm the two assumptions in `docs/dataset-takehome-orders.md` with whoever owns the source: month-first slash dates, and the `net_amount_usd` definition
 - [x] **T-2.9** Remote state configured: `joseroberts87-tf-backend-etl`, S3-native locking, no DynamoDB (D-32). **`terraform init -migrate-state` still has to be run** — see the README's State section
 

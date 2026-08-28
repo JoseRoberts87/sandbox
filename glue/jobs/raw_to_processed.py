@@ -18,6 +18,16 @@ it (D-19), so a rerun replaces rather than appends. Job bookmarks are disabled,
 which keeps all progress state visible in S3 rather than hidden in the Glue
 service.
 
+Two conventions worth knowing before reading the spec:
+
+* **`order_ts` is stored as a Unix epoch in seconds, UTC.** The source carries
+  four formats; the epoch removes the question of which one a row arrived in. A
+  value with no time component lands at midnight UTC of that date.
+* **Money is `double`, not `decimal`.** An absent price is required to be NaN,
+  and decimal types cannot represent one. This trades exactness on monetary
+  sums for that, and NaN propagates through any arithmetic it touches — which is
+  why the derived amounts guard `discount_pct` with `nanvl`.
+
 Datasets are declared in DATASET_SPECS below, keyed by "<source>/<dataset>".
 A spec gives the column list, target types, cleaning rule per column, and the
 constraints a row must satisfy. Nothing is inferred: CSV is read as all-strings
@@ -74,11 +84,13 @@ from pyspark.sql.window import Window
 # Dataset specifications
 #
 # cleaning rules:
-#   code  trim, collapse internal whitespace, UPPERCASE — identifiers and codes
-#   enum  trim, collapse whitespace, lowercase — closed sets and grouping keys
-#   text  trim, collapse whitespace, case preserved — free text for display
-#   money strip currency symbols, thousands separators and spaces
-#   trim  trim only
+#   text   trim, collapse internal whitespace, lowercase — every string column
+#   money  trim, then strip currency symbols and thousands separators
+#   trim   trim only — numerics and timestamps, which are cast, not cased
+#
+# Every rule trims. All text is lowercased, identifiers included: case carries no
+# meaning in this feed, and a single convention removes a whole class of
+# join-and-grouping bug where "EMEA" and "emea" are two values.
 # -----------------------------------------------------------------------------
 
 TAKEHOME_ORDERS = {
@@ -96,50 +108,126 @@ TAKEHOME_ORDERS = {
         "dd-MMM-yyyy",
     ],
     "columns": [
-        {"name": "order_id", "type": "string", "clean": "code", "required": True},
-        {"name": "order_ts", "type": "timestamp", "clean": "trim", "required": True},
-        {"name": "customer_id", "type": "string", "clean": "code", "required": True},
-        {"name": "region", "type": "string", "clean": "code"},
+        {
+            "name": "order_id",
+            "type": "string",
+            "clean": "text",
+            "required": True,
+            "pattern": r"^ord-\d+$",
+        },
+        # Stored as a Unix epoch in seconds, UTC. The four source formats are
+        # parsed to a timestamp first; a value with no time component lands at
+        # midnight UTC of that date, which is what the parse already produces.
+        {"name": "order_ts", "type": "epoch", "clean": "trim", "required": True},
+        # Not required (TR-05): an order with an unknown customer is still a
+        # real order with real revenue. `is_anonymous_customer` flags it.
+        {
+            "name": "customer_id",
+            "type": "string",
+            "clean": "text",
+            "pattern": r"^cust-\d+$",
+        },
+        {
+            "name": "region",
+            "type": "string",
+            "clean": "text",
+            # TR-01: the source mixes acronyms with a spelled-out name. Mapped
+            # to acronyms throughout, since that is the majority form.
+            "map": {"north america": "namer"},
+            # TR-02: closed set, so an unexpected region is quarantined rather
+            # than loaded silently, as channel and order_status already are.
+            "allowed": ["apac", "emea", "latam", "namer"],
+        },
         {
             "name": "channel",
             "type": "string",
-            "clean": "enum",
+            "clean": "text",
             "allowed": ["online", "partner", "retail", "wholesale"],
         },
-        {"name": "product_sku", "type": "string", "clean": "code", "required": True},
+        # TR-03: opaque. One SKU maps to many product names and categories, so
+        # this identifies nothing — not a join key, not a feature.
+        {
+            "name": "product_sku",
+            "type": "string",
+            "clean": "text",
+            "required": True,
+            "pattern": r"^sku-\d+$",
+        },
         {"name": "product_name", "type": "string", "clean": "text"},
-        {"name": "category", "type": "string", "clean": "enum"},
-        {"name": "quantity", "type": "int", "clean": "trim", "required": True, "min": 1},
+        {
+            "name": "category",
+            "type": "string",
+            "clean": "text",
+            "allowed": [
+                "accessories",
+                "board games",
+                "digital",
+                "miniatures",
+                "puzzles",
+                "trading cards",
+            ],
+        },
+        # Missing becomes NULL rather than a reject. Values below 1 are still
+        # quarantined: negatives appear evenly across every order status, which
+        # reads as corruption rather than return lines (TR-04).
+        {"name": "quantity", "type": "int", "clean": "trim", "min": 1},
+        # double, not decimal, because a missing value must become NaN and
+        # decimal types cannot represent it. See the note in the module
+        # docstring — this costs exactness on money.
         {
             "name": "unit_price_usd",
-            "type": "decimal(12,2)",
+            "type": "double",
             "clean": "money",
-            "required": True,
+            "missing": "nan",
             "min": 0,
         },
-        {"name": "discount_pct", "type": "double", "clean": "trim", "min": 0, "max": 1},
+        {
+            "name": "discount_pct",
+            "type": "double",
+            "clean": "trim",
+            "missing": "nan",
+            "min": 0,
+            "max": 1,
+        },
         {
             "name": "order_status",
             "type": "string",
-            "clean": "enum",
+            "clean": "text",
             "allowed": ["cancelled", "completed", "pending", "refunded"],
         },
-        # Nullable on purpose: an order that has not shipped has no value here.
+        # Nullable: an order that has not shipped has no value here.
         {"name": "shipping_days", "type": "int", "clean": "trim", "min": 0},
     ],
+    # TR-07: an order cannot have been placed after the run that reads it.
+    "reject_future": "order_ts",
     # Derived columns. Assumption: discount_pct is a fraction of the line total,
     # so net = quantity * unit_price * (1 - discount_pct).
     "derived": {
         "order_date": "to_date(order_ts)",
-        "gross_amount_usd": "cast(quantity * unit_price_usd as decimal(14,2))",
+        "order_year": "year(order_ts)",
+        "order_month": "month(order_ts)",
+        "order_dow": "dayofweek(order_ts) - 1",
+        # `coalesce` handles NULL but not NaN, and an absent discount is NaN
+        # here — without `nanvl` a missing discount would turn every derived
+        # amount into NaN. An absent *price* is left to propagate, because an
+        # amount computed from an unknown price is genuinely unknown.
+        "gross_amount_usd": "round(quantity * unit_price_usd, 2)",
         "net_amount_usd": (
-            "cast(round(quantity * unit_price_usd * (1 - coalesce(discount_pct, 0)), 2) "
-            "as decimal(14,2))"
+            "round(quantity * unit_price_usd * (1 - coalesce(nanvl(discount_pct, 0), 0)), 2)"
         ),
+        "discount_amount_usd": (
+            "round(quantity * unit_price_usd * coalesce(nanvl(discount_pct, 0), 0), 2)"
+        ),
+        "is_discounted": "coalesce(nanvl(discount_pct, 0), 0) > 0",
+        "is_digital": "category = 'digital'",
+        "is_anonymous_customer": "customer_id IS NULL",
     },
-    # Logged, never fatal: these are cross-row problems that a row-local
-    # transform cannot fix, and that the source system has to resolve.
-    "consistency": [{"key": "product_sku", "expect_single": ["product_name", "category"]}],
+    # Window-derived, so it cannot live in `derived` above.
+    "sequence": {
+        "name": "customer_order_seq",
+        "partition_by": "customer_id",
+        "order_by": "order_ts",
+    },
 }
 
 DATASET_SPECS = {
@@ -338,32 +426,45 @@ def clean_expression(column, rule):
     value = F.trim(F.col(column))
 
     if rule == "money":
+        # Currency symbols, thousands separators, stray spaces.
         value = F.regexp_replace(value, r"[^0-9.\-]", "")
-    elif rule in ("code", "enum", "text"):
-        value = F.trim(F.regexp_replace(value, r"\s+", " "))
-        if rule == "code":
-            value = F.upper(value)
-        elif rule == "enum":
-            value = F.lower(value)
+    elif rule == "text":
+        value = F.lower(F.trim(F.regexp_replace(value, r"\s+", " ")))
 
     return F.when(value == "", None).otherwise(value)
 
 
 def typed_frame(frame, spec):
-    """Add a cleaned, cast copy of every declared column as `_typed_<name>`."""
+    """Add a cleaned, cast copy of every declared column as `_typed_<name>`.
+
+    An `epoch` column is held as a timestamp here so the derived expressions can
+    use date functions on it; `select_clean` converts it to seconds on the way
+    out.
+    """
     for column in spec["columns"]:
         name = column["name"]
         cleaned = clean_expression(name, column.get("clean", "trim"))
 
-        if column["type"] == "timestamp":
-            parsed = F.coalesce(
+        if column["type"] in ("timestamp", "epoch"):
+            # First format that parses wins. A value with no time component
+            # lands at midnight of that date, in the session timezone (UTC).
+            value = F.coalesce(
                 *[F.to_timestamp(cleaned, fmt) for fmt in spec["timestamp_formats"]]
             )
-            frame = frame.withColumn(f"_typed_{name}", parsed)
         elif column["type"] == "string":
-            frame = frame.withColumn(f"_typed_{name}", cleaned)
+            value = cleaned
+            # Canonicalise before the allowed-list is checked, or the mapping
+            # would be judged against values it is meant to replace.
+            for source, target in column.get("map", {}).items():
+                value = F.when(value == source, F.lit(target)).otherwise(value)
         else:
-            frame = frame.withColumn(f"_typed_{name}", cleaned.cast(column["type"]))
+            value = cleaned.cast(column["type"])
+            # A missing number becomes NaN where asked, NULL otherwise. NaN is
+            # only representable in float and double.
+            if column.get("missing") == "nan":
+                value = F.when(value.isNull(), F.lit(float("nan"))).otherwise(value)
+
+        frame = frame.withColumn(f"_typed_{name}", value)
 
     return frame
 
@@ -381,12 +482,22 @@ def reject_reason_expression(spec, extra_required):
             checks.append(F.when(raw.isNull() | (F.trim(raw) == ""), F.lit(f"{name} is missing")))
 
         # Present in the file but unparseable: the value is wrong, not absent.
+        # A NaN default means "absent", so it must not read as unparseable.
+        unparsed = typed.isNull() if column.get("missing") != "nan" else F.isnan(typed)
         checks.append(
             F.when(
-                raw.isNotNull() & (F.trim(raw) != "") & typed.isNull(),
+                raw.isNotNull() & (F.trim(raw) != "") & unparsed,
                 F.concat(F.lit(f"{name} is not a valid {column['type']}: "), F.trim(raw)),
             )
         )
+
+        if "pattern" in column:
+            checks.append(
+                F.when(
+                    typed.isNotNull() & ~typed.rlike(column["pattern"]),
+                    F.concat(F.lit(f"{name} is malformed: "), typed),
+                )
+            )
 
         if "allowed" in column:
             checks.append(
@@ -396,15 +507,33 @@ def reject_reason_expression(spec, extra_required):
                 )
             )
 
+        # NaN means absent here, so it must not trip a bounds check.
+        real = typed.isNotNull() if column.get("missing") != "nan" else ~F.isnan(typed)
+
         if "min" in column:
             checks.append(
-                F.when(typed < F.lit(column["min"]), F.lit(f"{name} below minimum {column['min']}"))
+                F.when(
+                    real & (typed < F.lit(column["min"])),
+                    F.lit(f"{name} below minimum {column['min']}"),
+                )
             )
 
         if "max" in column:
             checks.append(
-                F.when(typed > F.lit(column["max"]), F.lit(f"{name} above maximum {column['max']}"))
+                F.when(
+                    real & (typed > F.lit(column["max"])),
+                    F.lit(f"{name} above maximum {column['max']}"),
+                )
             )
+
+    future_column = spec.get("reject_future")
+    if future_column:
+        checks.append(
+            F.when(
+                F.col(f"_typed_{future_column}") > F.current_timestamp(),
+                F.lit(f"{future_column} is in the future"),
+            )
+        )
 
     # concat_ws drops NULLs, so unfired checks contribute nothing.
     return F.concat_ws("; ", *checks)
@@ -420,6 +549,21 @@ def evaluate_rows(frame, spec, extra_required=()):
     evaluated = typed_frame(frame, spec).withColumn(
         "reject_reason", reject_reason_expression(spec, list(extra_required))
     )
+
+    # Exact duplicates first, and separately from key duplicates. A row that
+    # repeats in every field carries no information and needs no adjudication;
+    # a repeated key with differing values is a genuine conflict, and calling
+    # the first kind "duplicate order_id" would hide that difference.
+    source_columns = [column["name"] for column in spec["columns"]]
+    exact_window = Window.partitionBy(*source_columns).orderBy(F.lit(1))
+    evaluated = evaluated.withColumn("_exact_row", F.row_number().over(exact_window))
+    evaluated = evaluated.withColumn(
+        "reject_reason",
+        F.when(
+            (F.col("_exact_row") > 1) & (F.col("reject_reason") == ""),
+            F.lit("exact duplicate of an earlier row"),
+        ).otherwise(F.col("reject_reason")),
+    ).drop("_exact_row")
 
     # Duplicate primary keys: keep the most recent, quarantine the rest. Which
     # row is correct is a source-system question, so nothing is silently merged.
@@ -445,7 +589,12 @@ def evaluate_rows(frame, spec, extra_required=()):
 
 
 def select_clean(evaluated, spec):
-    """Typed columns under their final names, plus the spec's derived columns."""
+    """Typed columns under their final names, plus the spec's derived columns.
+
+    Derived expressions are evaluated while `epoch` columns are still
+    timestamps, so they can use date functions; the conversion to seconds
+    happens last.
+    """
     clean = evaluated.select(
         [F.col(f"_typed_{column['name']}").alias(column["name"]) for column in spec["columns"]]
     )
@@ -453,23 +602,27 @@ def select_clean(evaluated, spec):
     for name, expression in spec.get("derived", {}).items():
         clean = clean.withColumn(name, F.expr(expression))
 
-    return clean
-
-
-def log_consistency(frame, spec):
-    """Cross-row conflicts. Reported, never fatal — the source must fix these."""
-    for check in spec.get("consistency", []):
-        key = check["key"]
-        aggregates = [F.countDistinct(c).alias(c) for c in check["expect_single"]]
-        conflicts = (
-            frame.groupBy(key)
-            .agg(*aggregates)
-            .filter(" OR ".join(f"{c} > 1" for c in check["expect_single"]))
-            .collect()
+    sequence = spec.get("sequence")
+    if sequence:
+        # Nth order for this customer. Only meaningful within one snapshot: the
+        # history is whatever the current file holds.
+        window = Window.partitionBy(sequence["partition_by"]).orderBy(sequence["order_by"])
+        clean = clean.withColumn(sequence["name"], F.row_number().over(window))
+        # An anonymous customer has no sequence to belong to.
+        clean = clean.withColumn(
+            sequence["name"],
+            F.when(F.col(sequence["partition_by"]).isNull(), None).otherwise(
+                F.col(sequence["name"])
+            ),
         )
-        for row in conflicts:
-            detail = ", ".join(f"{c}={row[c]}" for c in check["expect_single"])
-            log(f"WARNING inconsistent source data: {key}={row[key]} maps to {detail}")
+
+    for column in spec["columns"]:
+        if column["type"] == "epoch":
+            clean = clean.withColumn(
+                column["name"], F.unix_timestamp(F.col(column["name"])).cast("long")
+            )
+
+    return clean
 
 
 def write_partition(glue_context, frame, path, dataset_root, database, table, update_catalog):
@@ -613,7 +766,6 @@ def main():
         )
 
     clean = select_clean(accepted, spec)
-    log_consistency(clean, spec)
 
     clean = add_lineage(clean, ingest_date, args["JOB_RUN_ID"])
     log(f"{accepted_rows} rows, {len(clean.columns)} columns -> {table_name}")

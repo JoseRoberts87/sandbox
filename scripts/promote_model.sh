@@ -52,15 +52,51 @@ else
   echo "Approved."
 fi
 
+# Point terraform.tfvars at the approved version.
+#
+# This does not weaken D-31. The deployed version still lives in version control
+# and still reaches the endpoint only through a reviewed diff and a manual
+# apply — the script types the ARN instead of a person, which removes a class of
+# paste error where a truncated or stale ARN silently deploys the wrong model.
+TFVARS="envs/dev/terraform.tfvars"
+
+if ! grep -qE '^[[:space:]]*approved_model_package_arn[[:space:]]*=' "$TFVARS"; then
+  cat >&2 <<MSG
+error: no approved_model_package_arn assignment in $TFVARS.
+
+Add it by hand, then re-run:
+
+    approved_model_package_arn = "$PACKAGE_ARN"
+MSG
+  exit 1
+fi
+
+CURRENT_ARN=$(grep -E '^[[:space:]]*approved_model_package_arn[[:space:]]*=' "$TFVARS" \
+  | sed -E 's/.*"([^"]*)".*/\1/')
+
+if [[ "$CURRENT_ARN" == "$PACKAGE_ARN" ]]; then
+  echo "$TFVARS already points at this version."
+else
+  # `|` as the delimiter: an ARN contains slashes but never a pipe.
+  sed -i.bak -E \
+    "s|^([[:space:]]*approved_model_package_arn[[:space:]]*=[[:space:]]*).*|\1\"$PACKAGE_ARN\"|" \
+    "$TFVARS"
+  rm -f "$TFVARS.bak"
+
+  echo "$TFVARS updated"
+  echo "  was: ${CURRENT_ARN:-(empty)}"
+  echo "  now: $PACKAGE_ARN"
+  echo
+  echo "The change, for review:"
+  git --no-pager diff -- "$TFVARS" | sed 's/^/  /'
+fi
+
 cat <<MSG
 
-Approved, but not yet served. To deploy it, set this in
-envs/dev/terraform.tfvars and apply:
+Approved and recorded, but not yet served. Review the change above, then:
 
-  approved_model_package_arn = "$PACKAGE_ARN"
-
-  terraform -chdir=envs/dev plan
-  terraform -chdir=envs/dev apply
+  make plan
+  make apply
 
 The first apply creates the endpoint, the Lambda proxy and the public API.
 Later ones roll the endpoint onto the new version in place.
