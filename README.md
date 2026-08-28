@@ -672,6 +672,25 @@ aws sagemaker list-models --name-contains refund-risk \
 aws sagemaker delete-model --model-name <orphan>
 ```
 
+**Every request returns `403 {"message":"Forbidden"}`**
+The API key is not being accepted. `make smoke` now checks the key before
+running anything and names which of these it is; to check by hand:
+
+```bash
+KEY=$(terraform -chdir=envs/dev output -raw predict_api_key_id)
+
+aws apigateway get-api-key --api-key "$KEY" --include-value \
+  --query '{enabled:enabled,hasValue:value!=null}'
+aws apigateway get-usage-plans --key-id "$KEY" \
+  --query 'items[].{plan:name,stages:apiStages}'
+```
+
+A key that exists but is attached to no usage plan covering the stage is
+refused exactly as no key at all. On a **fresh deploy** the association can take
+a short while to propagate, which looks identical — the smoke test retries
+during warm-up for that reason, so a first run shortly after `make apply` may
+simply need running again.
+
 **`CloudWatch Logs role ARN must be set in account settings to enable logging`**
 API Gateway will not attach a log destination to a stage until the account has a
 CloudWatch Logs role. This configuration creates one

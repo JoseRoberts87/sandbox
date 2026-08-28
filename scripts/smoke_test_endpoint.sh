@@ -21,7 +21,45 @@ fi
 
 URL=$(tf_output predict_url)
 KEY_ID=$(tf_output predict_api_key_id)
-API_KEY=$(aws apigateway get-api-key --api-key "$KEY_ID" --include-value --query value --output text)
+API_KEY=$(aws apigateway get-api-key --api-key "$KEY_ID" --include-value \
+  --query value --output text 2>/dev/null) || API_KEY=""
+
+# Without this, an unreadable key is sent as an empty header and every check
+# returns 403 — nine failures describing one problem, none of them naming it.
+if [[ -z "$API_KEY" || "$API_KEY" == "None" ]]; then
+  cat >&2 <<MSG
+error: could not read the value of API key $KEY_ID.
+
+  aws apigateway get-api-key --api-key $KEY_ID --include-value
+
+Without a key every request is refused with 403 and no check can pass.
+MSG
+  exit 1
+fi
+
+ENABLED=$(aws apigateway get-api-key --api-key "$KEY_ID" --query enabled --output text 2>/dev/null)
+if [[ "$ENABLED" != "True" ]]; then
+  echo "error: API key $KEY_ID is disabled." >&2
+  exit 1
+fi
+
+# A key with no usage plan covering this stage is refused exactly like no key
+# at all, which is the confusing case worth naming up front.
+PLANS=$(aws apigateway get-usage-plans --key-id "$KEY_ID" \
+  --query "length(items[?apiStages[?stage=='$(tf_output environment)'])]" \
+  --output text 2>/dev/null) || PLANS=""
+if [[ "$PLANS" == "0" ]]; then
+  cat >&2 <<MSG
+error: API key $KEY_ID is not attached to a usage plan covering this stage.
+
+API Gateway refuses such a key exactly as it refuses no key at all, so every
+check would report 403. Inspect with:
+
+  aws apigateway get-usage-plans --key-id $KEY_ID
+
+MSG
+  exit 1
+fi
 
 echo "POST $URL"
 
@@ -93,7 +131,20 @@ done
 # A serverless endpoint that has scaled to zero answers the first call slowly,
 # or with a 503. That is expected, not a failure.
 echo "warming up (a cold start can take several seconds)"
-request "{\"instances\":[$ORDER]}" >/dev/null || true
+for attempt in 1 2 3 4 5 6; do
+  warm_status=$(request "{\"instances\":[$ORDER]}") || warm_status=000
+  [[ "$warm_status" == "200" ]] && break
+  # A usage-plan key association is not instant on a fresh deploy, and reads
+  # as 403 until it propagates. Worth waiting for rather than failing nine
+  # checks over it.
+  [[ "$warm_status" == "403" || "$warm_status" == "503" ]] || break
+  sleep 5
+done
+if [[ "${warm_status:-}" == "403" ]]; then
+  echo "  still 403 after retrying — the key exists and is attached, so this is" >&2
+  echo "  not propagation. Check that the stage was deployed after the method" >&2
+  echo "  set api_key_required: aws apigateway get-stage --rest-api-id ... " >&2
+fi
 
 check "scores one order"                    200 "{\"instances\":[$ORDER]}"
 check "scores a batch, one result per order" 200 "{\"instances\":[$ORDER,$OTHER]}"
@@ -125,7 +176,13 @@ SHOUTY=$(printf '%s' "$ORDER" | sed 's/"emea"/"  EMEA  "/; s/"retail"/"Retail"/;
 request "{\"instances\":[$ORDER]}"  >/dev/null; LOWER=$(cat /tmp/predict_response.json)
 request "{\"instances\":[$SHOUTY]}" >/dev/null; MIXED=$(cat /tmp/predict_response.json)
 
-if [[ "$LOWER" == "$MIXED" ]]; then
+if [[ "$LOWER" != *refund_probability* ]]; then
+  # Two identical errors are equal, and equality was the whole assertion — this
+  # reported "ok" while every request was being refused with 403.
+  printf '  \033[31mFAIL\033[0m  %s\n' "mixed case: no prediction returned, so nothing was compared"
+  fail=1
+  failed=$((failed + 1))
+elif [[ "$LOWER" == "$MIXED" ]]; then
   printf '  \033[32mok\033[0m    %s\n' "scores mixed case identically to lowercase"
   passed=$((passed + 1))
 else
