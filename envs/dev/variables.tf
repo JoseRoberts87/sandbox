@@ -298,6 +298,7 @@ variable "predict_required_fields" {
     "quantity",
     "unit_price_usd",
     "discount_pct",
+    "shipping_days",
     "order_dow",
   ]
 }

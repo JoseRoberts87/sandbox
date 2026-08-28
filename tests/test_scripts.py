@@ -100,6 +100,19 @@ class TestMakefile:
         documented = set(re.findall(r"^([a-z][a-z-]*):.*?##", makefile, re.M))
         assert not targets - documented
 
+    def test_promote_can_find_the_line_it_edits(self):
+        """`promote_model.sh` rewrites `approved_model_package_arn` with sed.
+        If the assignment is reformatted past what its pattern matches, the
+        script refuses rather than corrupting the file — but the refusal is a
+        failed promotion, so the shape is worth pinning."""
+        tfvars = (ROOT / "envs" / "dev" / "terraform.tfvars").read_text()
+        matches = re.findall(
+            r'^[ \t]*approved_model_package_arn[ \t]*=[ \t]*"[^"]*"[ \t]*$',
+            tfvars,
+            re.M,
+        )
+        assert len(matches) == 1, "expected exactly one assignment the script can rewrite"
+
     def test_targets_are_phony(self, makefile):
         """None of these produce a file of their own name, so a stray file
         called `test` or `check` would otherwise silently disable the target."""

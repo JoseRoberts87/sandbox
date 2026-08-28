@@ -25,6 +25,7 @@ S3 (raw) ──Glue──► S3 (processed) ──Spectrum──► Redshift ─
 - **Task tracker:** [TODO.md](./TODO.md) (`T-##`)
 - **S3 layout and reprocessing semantics:** [docs/data-layout.md](./docs/data-layout.md)
 - **The dataset:** [docs/dataset-takehome-orders.md](./docs/dataset-takehome-orders.md)
+- **Transformations under review:** [docs/proposed-transformations.md](./docs/proposed-transformations.md) (`TR-##`)
 - **Every AI prompt and output:** [AI_USAGE.md](./AI_USAGE.md)
 
 ---
@@ -250,13 +251,20 @@ make etl DATE=latest          # redo the most recent load in place
 ```
 
 Starts the Glue job and waits for it. It reads every file under the dataset
-prefix, cleans and types it against the declared schema, and writes Snappy
-Parquet to one `ingest_date` partition.
+prefix, cleans and types it against a declared schema — nothing is inferred —
+and writes Snappy Parquet to one `ingest_date` partition.
+
+What it does to each row, in short: trims every field and lowercases all text;
+parses four timestamp formats into a **UTC Unix epoch**, with date-only values
+landing at midnight; strips currency symbols; defaults missing integers to NULL
+and missing floats to NaN; and adds derived columns for dates, amounts and
+flags. The full contract is in
+[docs/dataset-takehome-orders.md](./docs/dataset-takehome-orders.md).
 
 Rows that fail validation are **quarantined, not dropped**, under
-`_rejected/takehome/orders/…` with a `reject_reason` column. The run fails if
-more than `etl_max_reject_pct` (5%) of rows are rejected. On the sample data
-expect 19 rows in, 19 out, 0 rejected.
+`_rejected/takehome/orders/…` with a `reject_reason` column naming every reason
+that row failed. The run fails if more than `etl_max_reject_pct` of rows are
+rejected — a threshold worth re-deriving once you have seen a real run.
 
 ### 3. Apply the schema migrations — **manual, and not part of `terraform apply`**
 
@@ -302,33 +310,34 @@ when the order is placed. What it learns from — and what it must not see — i
 defined in
 [`sql/migrations/005_ml_training_view.sql`](./sql/migrations/005_ml_training_view.sql).
 
-> On 19 sample rows this scores an ROC AUC around 0.54 — indistinguishable from
-> guessing, and the training script says so itself. The deliverable is the
-> pipeline, not the model.
+> The training script reports cross-validated metrics and warns when the dataset
+> is too small for them to mean anything. Treat the pipeline as the deliverable
+> and the score as a by-product until the open questions in
+> [proposed-transformations.md](./docs/proposed-transformations.md) are settled —
+> TR-16 in particular, since an unconfirmed date convention feeds `order_dow`.
 
-### 6. Deploy the model — **two manual steps, deliberately**
+### 6. Deploy the model — **approve, then apply**
 
 ```bash
-make promote
+make promote        # approve, and record the ARN in terraform.tfvars
+make plan           # review the diff and the plan
+make apply
 ```
 
-Approves a registry version. **This deploys nothing.** It prints an ARN; paste
-it into `envs/dev/terraform.tfvars`:
+`make promote` shows you the candidate version and asks before approving.
+**Approving deploys nothing.** On approval it writes
+`approved_model_package_arn` into `envs/dev/terraform.tfvars` and prints the
+change:
 
 ```hcl
 approved_model_package_arn = "arn:aws:sagemaker:us-east-1:...:model-package/.../1"
 ```
 
-Then:
-
-```bash
-make apply
-```
-
-Serving a model is therefore a reviewed diff, not a side effect (D-31). The
-first apply creates the endpoint, the Lambda proxy and the public API; later
-ones roll the endpoint onto a new version in place. Clearing the ARN removes the
-whole inference stack.
+Serving a model is therefore still a reviewed diff, not a side effect (D-31) —
+the script types the ARN, but nothing reaches the endpoint until you have read
+the change and applied it. The first apply creates the endpoint, the Lambda
+proxy and the public API; later ones roll the endpoint onto a new version in
+place. Clearing the ARN removes the whole inference stack.
 
 ### 7. Call it
 
@@ -349,13 +358,19 @@ KEY=$(aws apigateway get-api-key \
   --include-value --query value --output text)
 
 curl -X POST "$URL" -H "x-api-key: $KEY" -H 'Content-Type: application/json' \
-  -d '{"instances":[{"region":"EMEA","channel":"retail","category":"puzzles",
-       "quantity":2,"unit_price_usd":30.0,"discount_pct":0.0,"order_dow":3}]}'
+  -d '{"instances":[{"region":"emea","channel":"retail","category":"puzzles",
+       "quantity":2,"unit_price_usd":30.0,"discount_pct":0.0,
+       "shipping_days":4,"order_dow":3}]}'
 ```
 
 ```json
 {"predictions": [{"refund_probability": 0.221630}]}
 ```
+
+Every field above is required; the proxy rejects a request missing any of them
+before it reaches the model. The list is
+`predict_required_fields` in `envs/dev/terraform.tfvars`, and a test keeps it in
+step with the model's features.
 
 | Response | Meaning |
 |---|---|
@@ -379,8 +394,8 @@ These are the things no target can do for you, and why.
 | `aws sso login` | Interactive |
 | `terraform apply` | A developer reviews the plan (D-07). Never auto-approved |
 | `make migrate` | Terraform does not own schema (D-38). Automated by `make data`, but never by an apply |
-| Approving a model | A human decides a version is fit to serve (D-31) |
-| Editing `approved_model_package_arn` | Keeps the deployed version in a reviewed diff (D-31) |
+| Approving a model | A human decides a version is fit to serve (D-31). `make promote` records the ARN afterwards, but the decision is the prompt |
+| Reviewing and applying that change | Nothing reaches the endpoint until the diff is read and applied (D-07, D-31) |
 | Committing and pushing | Never done unprompted (D-08) |
 
 ---
@@ -560,6 +575,29 @@ CloudWatch Logs role. This configuration creates one
 setting, so destroying this stack disables API Gateway logging for the whole
 account. See T-5.15 before using this in a shared account.
 
+**`column "..." does not exist`, migrating or loading**
+The transform changed and something downstream still has the old shape. Which
+one depends on where it failed:
+
+| Message names | Stale thing |
+|---|---|
+| `... in orders` | `landing.orders` — the warehouse table |
+| `... in takehome_orders` | the processed Parquet, or its catalog entry |
+
+Both are rebuilt by the same command, which does the whole chain in order:
+
+```bash
+make apply          # first, if the job script changed
+make rebuild        # reset catalog → re-run ETL → drop → migrate → load
+```
+
+Nothing is lost: the processed zone is regenerable from raw, and the warehouse
+table is a copy of the processed zone.
+
+`make load` checks the processed columns before it starts, so a stale processed
+zone is reported as a list of missing columns and the fix, rather than one
+column at a time from Redshift.
+
 **`InvalidClientTokenId` from `terraform plan`**
 The SSO token expired. `aws sso login --profile <profile>`.
 
@@ -610,6 +648,8 @@ to see what a target actually does, this is the whole mapping.
 | `land` | `bash scripts/land_sample_data.sh` |
 | `etl` | `bash scripts/run_etl.sh [DATE]` |
 | `migrate` | `bash scripts/redshift_sql.sh sql/migrations` |
+| `reset-catalog` | `bash scripts/reset_catalog_table.sh` |
+| `rebuild` | `reset-catalog`, `etl`, `bash scripts/redshift_sql.sh sql/rebuild_landing_orders.sql`, `migrate`, `load` |
 | `load` | `bash scripts/load_warehouse.sh [DATE]` |
 | `train` | `bash scripts/train_model.sh` |
 | `promote` | `bash scripts/promote_model.sh` |
@@ -643,7 +683,7 @@ ml/                         train.py and inference.py — run locally and in Sag
 lambda/predict/             API Gateway → SageMaker proxy
 sql/                        migrations, the partition load, the training UNLOAD
 scripts/                    the manual steps, scripted (see the table above)
-tests/                      pytest: helpers, spec invariants, transform, model, proxy
+tests/                      pytest: helpers, spec invariants, transform, SQL, model, proxy
 data/                       the sample dataset
 docs/                       data layout and dataset documentation
 ```

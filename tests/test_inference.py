@@ -41,12 +41,12 @@ def model_dir(tmp_path_factory, train):
     data = tmp_path_factory.mktemp("data")
 
     rows = [
-        ("ORD-1", "EMEA", "retail", "puzzles", 1, 10.0, 0.00, 1, 0),
-        ("ORD-2", "EMEA", "online", "puzzles", 2, 20.0, 0.10, 2, 1),
-        ("ORD-3", "APAC", "retail", "digital", 1, 15.0, 0.00, 3, 0),
-        ("ORD-4", "APAC", "partner", "digital", 4, 40.0, 0.25, 4, 1),
-        ("ORD-5", "LATAM", "retail", "puzzles", 1, 12.0, 0.00, 5, 0),
-        ("ORD-6", "EMEA", "wholesale", "digital", 3, 30.0, 0.05, 6, 1),
+        ("ord-1", "emea", "retail", "puzzles", 1, 10.0, 0.00, 3, 1, 0),
+        ("ord-2", "emea", "online", "puzzles", 2, 20.0, 0.10, 9, 2, 1),
+        ("ord-3", "apac", "retail", "digital", 1, 15.0, 0.00, 2, 3, 0),
+        ("ord-4", "apac", "partner", "digital", 4, 40.0, 0.25, 14, 4, 1),
+        ("ord-5", "latam", "retail", "puzzles", 1, 12.0, 0.00, 4, 5, 0),
+        ("ord-6", "emea", "wholesale", "digital", 3, 30.0, 0.05, 11, 6, 1),
     ]
     columns = train.ID_COLUMNS + train.FEATURES + [train.TARGET]
     pd.DataFrame(rows, columns=columns).to_csv(data / "training.csv", index=False)
@@ -61,8 +61,9 @@ def model(inference, model_dir):
 
 
 ORDER = {
-    "region": "EMEA", "channel": "retail", "category": "puzzles",
-    "quantity": 2, "unit_price_usd": 30.0, "discount_pct": 0.0, "order_dow": 3,
+    "region": "emea", "channel": "retail", "category": "puzzles",
+    "quantity": 2, "unit_price_usd": 30.0, "discount_pct": 0.0,
+    "shipping_days": 4, "order_dow": 3,
 }
 
 

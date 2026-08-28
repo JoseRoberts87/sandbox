@@ -5,8 +5,9 @@ declared in `DATASET_SPECS["takehome/orders"]` in
 [`glue/jobs/raw_to_processed.py`](../glue/jobs/raw_to_processed.py) — this
 document explains the *why*; the job is the source of truth for the *what*.
 
-**Source file:** `data/dpe_interview_takehome_data.csv` — 19 rows, 13 columns,
-CSV with header.
+**Source file:** `data/dpe_interview_takehome_data.csv` — CSV with a header row.
+The file is replaced from time to time and its size varies, so nothing here
+depends on a row count; the properties below are what hold.
 
 ## Landing it
 
@@ -30,35 +31,47 @@ partition for the day it runs.
 
 ## Schema
 
-| Column | Source | Target | Cleaning | Constraints |
+| Column | Source | Stored as | Cleaning | Constraints |
 |---|---|---|---|---|
-| `order_id` | string | `string` | code | required, primary key |
-| `order_ts` | string, 4 formats | `timestamp` | trim | required |
-| `customer_id` | string | `string` | code | required |
-| `region` | string | `string` | code | — |
-| `channel` | string | `string` | enum | one of online, partner, retail, wholesale |
-| `product_sku` | string | `string` | code | required |
+| `order_id` | string | `string` | text | required, primary key, `^ord-\d+$` |
+| `order_ts` | string, 4 formats | `bigint` — Unix epoch, seconds, UTC | trim | required, not in the future |
+| `customer_id` | string | `string` | text | `^cust-\d+$`, **nullable** |
+| `region` | string | `string` | text | one of apac, emea, latam, namer |
+| `channel` | string | `string` | text | one of online, partner, retail, wholesale |
+| `product_sku` | string | `string` | text | required, `^sku-\d+$`, **opaque** |
 | `product_name` | string | `string` | text | — |
-| `category` | string | `string` | enum | — |
-| `quantity` | string | `int` | trim | required, >= 1 |
-| `unit_price_usd` | string, may carry `$` | `decimal(12,2)` | money | required, >= 0 |
-| `discount_pct` | string | `double` | trim | 0 – 1 |
-| `order_status` | string | `string` | enum | one of cancelled, completed, pending, refunded |
-| `shipping_days` | string, may be blank | `int` | trim | >= 0, **nullable** |
+| `category` | string | `string` | text | one of accessories, board games, digital, miniatures, puzzles, trading cards |
+| `quantity` | string | `int` | trim | >= 1; **missing → NULL** |
+| `unit_price_usd` | string, may carry `$` | `double` | money | >= 0; **missing → NaN** |
+| `discount_pct` | string | `double` | trim | 0 – 1; **missing → NaN** |
+| `order_status` | string | `string` | text | one of cancelled, completed, pending, refunded |
+| `shipping_days` | string | `int` | trim | >= 0; **missing → NULL** |
 
 Cleaning rules:
 
 | Rule | Applied to | Effect |
 |---|---|---|
-| `code` | identifiers, `region` | trim, collapse internal whitespace, UPPERCASE |
-| `enum` | closed sets and grouping keys | trim, collapse whitespace, lowercase |
-| `text` | `product_name` | trim, collapse whitespace, case preserved |
-| `money` | `unit_price_usd` | strip currency symbols and separators |
-| `trim` | numerics, `order_ts` | trim only |
+| `text` | every string column | trim, collapse internal whitespace, **lowercase** |
+| `money` | `unit_price_usd` | trim, then strip currency symbols and thousands separators |
+| `trim` | numerics and `order_ts` | trim only — these are cast, not cased |
 
-Identifiers are uppercased because they are codes; grouping dimensions are
-lowercased because they are join keys where case must not create duplicates;
-display text keeps its case because nothing joins on it.
+Every rule trims. All text is lowercased, identifiers included: case carries no
+meaning in this feed, and one convention removes a class of bug where `EMEA` and
+`emea` are two different values.
+
+### Two type choices worth knowing
+
+**`order_ts` is an epoch.** The source carries four formats; storing seconds
+since 1970 UTC removes the question of which one a row arrived in. A value with
+no time component lands at midnight UTC of that date. Read it back with
+`TIMESTAMP 'epoch' + order_ts * INTERVAL '1 second'`, or use the derived
+`order_date` / `order_year` / `order_month` / `order_dow`.
+
+**Money is `double`, not `decimal`.** A missing price is required to be NaN and
+decimal types cannot hold one, so exactness on monetary sums is traded for that.
+NaN also propagates through arithmetic, which is why the derived amounts guard
+`discount_pct` with `nanvl` — otherwise one absent discount would turn every
+amount on that row into NaN.
 
 ## What was wrong with the source data
 
@@ -67,35 +80,47 @@ declares types rather than inferring them:
 
 | Problem | Detail |
 |---|---|
-| **Four timestamp formats in one column** | `yyyy-MM-dd HH:mm:ss` (10 rows), `MM/dd/yyyy` (4), `dd-MMM-yyyy` (3), `yyyy-MM-dd'T'HH:mm:ss'Z'` (2) |
+| **Four timestamp formats in one column** | `yyyy-MM-dd HH:mm:ss`, `MM/dd/yyyy`, `dd-MMM-yyyy`, `yyyy-MM-dd'T'HH:mm:ss'Z'` — the first is the most common, all four are well represented |
 | **Currency symbol in a numeric column** | `$159.28` in `unit_price_usd`; every other value is bare |
 | **Case variants** | `region` 7 distinct → 4 real values (`North America`, `NORTH AMERICA`, `emea`, `EMEA`…); `channel` 6 → 4 |
 | **Leading/trailing whitespace** | `category` 10 distinct → 6 real values (`  Puzzles `, `  Accessories `…) |
 | **Blank numeric** | one blank `shipping_days` |
-| **Inconsistent SKU mapping** | `SKU-1067` maps to both *Paint Set* (miniatures) and *Dungeon Delve* (board games) |
+| **`product_sku` carries no product identity** | Effectively every SKU maps to many different product names *and* categories. This is not a few bad rows — the column does not identify a product, so it is useless as a join key or a feature |
 
-`order_id` is unique across all 19 rows, and no slash-format date is ambiguous —
-every one has a day component greater than 12, which is the only reason
-month-first parsing is safe to assume here. **If a future file contains
-`03/04/2025`, that assumption breaks silently.** Worth confirming with the source
-system rather than relying on the current data.
+**`order_id` is not unique.** A minority of ids appear more than once; the job
+keeps the most recent by `order_ts` and quarantines the rest rather than merging
+them, because which row is correct is a source-system question.
 
-The SKU conflict is a cross-row problem that a row-level transform cannot fix.
-The job logs it as a warning and loads the rows unchanged; resolving it is a
-source-system question.
+**Slash-format dates are ambiguous, and this is unresolved.** A meaningful share
+of them have both components ≤ 12 — `04/03/2025` reads as 3 April or 4 March
+depending on the convention. The evidence favours month-first (the first
+component is never greater than 12 anywhere in the file, across a large sample),
+but that is inference, not confirmation: a dd/MM source would produce exactly the
+same pattern. Until the source confirms it, those rows carry a silently wrong
+date, and `order_date` and the derived `order_dow` inherit it. Tracked as
+**T-2.16**.
+
+The SKU problem is a cross-row one that a row-level transform cannot fix. The job
+currently logs a warning per conflicting SKU, which at this scale means a warning
+for nearly every SKU on every run — noise rather than signal. Either the check
+should be dropped or the column should be treated as opaque.
 
 ## Derived columns
 
 | Column | Definition |
 |---|---|
 | `order_date` | `to_date(order_ts)` |
+| `order_year`, `order_month`, `order_dow` | Extracted from `order_ts`, so analytics and the model share one definition |
 | `gross_amount_usd` | `quantity * unit_price_usd` |
-| `net_amount_usd` | `quantity * unit_price_usd * (1 - discount_pct)`, rounded to 2dp |
+| `net_amount_usd` | `quantity * unit_price_usd * (1 - discount_pct)`, rounded |
+| `discount_amount_usd` | `quantity * unit_price_usd * discount_pct`, rounded |
+| `is_discounted` | `discount_pct > 0` |
+| `is_digital` | `category = 'digital'` |
+| `is_anonymous_customer` | `customer_id IS NULL` |
+| `customer_order_seq` | Nth order for this customer by `order_ts`. Only meaningful within one snapshot — the history is whatever the current file holds — and NULL for anonymous orders |
 
-**Assumption:** `discount_pct` is a fraction (observed range 0 – 0.25, not
-0 – 100) applied to the whole line. Unconfirmed — if discounts are per-unit or
-already reflected in `unit_price_usd`, `net_amount_usd` is wrong and both the
-definition and this note need updating.
+**Assumption:** `discount_pct` is a fraction applied to the whole line, not per
+unit and not already reflected in `unit_price_usd`. Unconfirmed.
 
 Plus the lineage columns every processed table carries: `ingest_date`,
 `etl_source_file`, `etl_processed_at`, `etl_job_run_id`.
@@ -119,8 +144,23 @@ Structural problems — a missing column, an unreadable path, an empty partition
 fail the run immediately instead, because they mean the file is not what we think
 it is.
 
-On the current file: **19 rows in, 19 accepted, 0 rejected.** Every defect above
-is repaired by a cleaning rule rather than being a reason to reject.
+Most defects above are repaired by a cleaning rule rather than being a reason to
+reject. What is rejected, and roughly in this order of frequency:
+
+| Reason | Nature |
+|---|---|
+| `quantity` below 1 | Negative quantities appear across every order status in similar proportion. Concentrated in `refunded` they would read as returns; spread evenly they read as corruption |
+| duplicate `order_id` | Superseded rows, kept out rather than merged |
+| `customer_id` missing | A required field, so the whole row is quarantined |
+
+Together these have run close to the 5% `--max_reject_pct` ceiling, so the
+threshold and the `quantity` rule both deserve a deliberate decision rather than
+being left where they are.
+
+## Proposed changes
+
+Candidates from profiling the source, awaiting review:
+[proposed-transformations.md](./proposed-transformations.md) (`TR-##`).
 
 ## Open questions
 

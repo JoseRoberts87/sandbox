@@ -39,6 +39,41 @@ if [[ -z "$INGEST_DATE" ]]; then
   echo "newest partition: $INGEST_DATE"
 fi
 
+# The load names columns explicitly, so a processed zone written by an older
+# version of the job fails on a column Redshift reports one at a time. Check the
+# whole list up front and say what to do about it.
+MISSING=$(scripts/redshift_query.sh "SELECT columnname FROM svv_external_columns
+  WHERE schemaname = 'processed_ext' AND tablename = '${SOURCE_NAME}_${DATASET}'" 2>/dev/null \
+  | python3 -c '
+import re, sys
+from pathlib import Path
+
+present = {line.strip() for line in sys.stdin if re.fullmatch(r"[a-z_]+", line.strip())}
+if not present:
+    sys.exit(0)  # cannot tell; let the load report whatever is wrong
+
+load = Path("sql/load_orders.sql").read_text()
+select = re.search(r"\)\s*SELECT(.*?)FROM processed_ext", load, re.S).group(1)
+needed = [c for c in re.findall(r"[a-z_]+", select) if c not in ("cast", "as", "date")]
+print(",".join(c for c in needed if c not in present))
+') || MISSING=""
+
+if [[ -n "$MISSING" ]]; then
+  cat >&2 <<MSG
+error: the processed zone is missing columns the load expects:
+
+  $MISSING
+
+That means it was written by an older version of the Glue job. Deploy the
+current one and rewrite the partition:
+
+  make apply
+  make etl
+  make load
+MSG
+  exit 1
+fi
+
 scripts/redshift_sql.sh sql/load_orders.sql "ingest_date=$INGEST_DATE"
 
 echo

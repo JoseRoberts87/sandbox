@@ -42,7 +42,18 @@ ID_COLUMNS = ["order_id"]
 # Must match the SELECT list in 005_ml_training_view.sql. A mismatch is caught
 # at training time by the column check in load_training_data().
 CATEGORICAL_FEATURES = ["region", "channel", "category"]
-NUMERIC_FEATURES = ["quantity", "unit_price_usd", "discount_pct", "order_dow"]
+# shipping_days is included deliberately (TR-15). It looks like leakage and is
+# not: it is populated on pending orders, which have not shipped, and cancelled
+# ones, which never will — so it is an estimate available when the order is
+# placed. If the source says otherwise, remove it here and from the training
+# view together, or the drift test fails.
+NUMERIC_FEATURES = [
+    "quantity",
+    "unit_price_usd",
+    "discount_pct",
+    "shipping_days",
+    "order_dow",
+]
 FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
 
 MODEL_FILENAME = "model.joblib"

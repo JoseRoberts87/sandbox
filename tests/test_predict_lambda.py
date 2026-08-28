@@ -19,8 +19,9 @@ ENDPOINT = "sandbox-dev-refund-risk"
 
 
 ORDER = {
-    "region": "EMEA", "channel": "retail", "category": "puzzles",
-    "quantity": 2, "unit_price_usd": 30.0, "discount_pct": 0.0, "order_dow": 3,
+    "region": "emea", "channel": "retail", "category": "puzzles",
+    "quantity": 2, "unit_price_usd": 30.0, "discount_pct": 0.0,
+    "shipping_days": 4, "order_dow": 3,
 }
 
 

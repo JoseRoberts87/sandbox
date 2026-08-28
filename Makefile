@@ -20,7 +20,7 @@ DATE ?=
 
 .PHONY: help preflight install check test test-fast fmt \
         init plan apply output destroy \
-        land etl migrate load train promote smoke verify query \
+        land etl migrate rebuild reset-catalog load train promote smoke verify query \
         deploy data model bootstrap clean
 
 help: ## Show this help
@@ -85,13 +85,26 @@ etl: ## Run the Glue job and wait for it  [DATE=YYYY-MM-DD|latest]
 migrate: ## Apply the Redshift schema migrations (not done by terraform apply)
 	scripts/redshift_sql.sh sql/migrations
 
+reset-catalog: ## Delete the processed catalog table so the next ETL run recreates it
+	scripts/reset_catalog_table.sh
+
+rebuild: ## Full rebuild after a transform change: re-run the ETL, then the warehouse
+	@echo "Rebuilding after a schema change. Run 'make apply' first if the job"
+	@echo "script changed, or the ETL will rewrite the old shape."
+	@echo
+	scripts/reset_catalog_table.sh
+	$(MAKE) etl
+	scripts/redshift_sql.sh sql/rebuild_landing_orders.sql
+	$(MAKE) migrate
+	$(MAKE) load
+
 load: ## Load a processed snapshot into Redshift  [DATE=YYYY-MM-DD]
 	scripts/load_warehouse.sh $(DATE)
 
 train: ## Unload the training set, train, and register a candidate version
 	scripts/train_model.sh
 
-promote: ## Approve a version, then print the tfvars line that deploys it
+promote: ## Approve a version and record its ARN in terraform.tfvars for review
 	scripts/promote_model.sh
 
 smoke: ## Call the public prediction API the way an external consumer would
