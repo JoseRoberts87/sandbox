@@ -1,0 +1,25 @@
+-- One-time rebuild for an environment created before the transform changed.
+--
+-- Deliberately NOT in sql/migrations/. Migrations are ordered and re-runnable;
+-- this is neither. A first attempt put it at 006 and failed, because 005 builds
+-- a view over columns the rebuild had not yet created — a rebuild cannot sit
+-- after the definitions that depend on it.
+--
+-- It drops only. The migrations then recreate everything from their own
+-- definitions, so there is no second copy of the DDL to keep in step.
+--
+-- The processed schema changed incompatibly: order_ts became a Unix epoch,
+-- money became DOUBLE PRECISION so a missing price can be NaN, and derived
+-- columns were added. `CREATE TABLE IF NOT EXISTS` cannot alter a table that
+-- already exists, so without this an environment keeps the old schema and every
+-- load fails on the column list.
+--
+-- landing.orders is a copy of the processed zone, so dropping it loses nothing
+-- that `make load` cannot rebuild. CASCADE takes the dependent views with it;
+-- migrations 004 and 005 recreate them.
+--
+--   scripts/redshift_sql.sh sql/rebuild_landing_orders.sql
+--   make migrate
+--   make load
+
+DROP TABLE IF EXISTS landing.orders CASCADE;
