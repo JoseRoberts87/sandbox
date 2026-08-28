@@ -339,7 +339,11 @@ training and inference use the identical code path. **Depends on Q-02/Q-03.**
 
 **Decided (2026-08-27).** The split runs along one line: **row selection and labelling in the warehouse, row-local transforms in the model artifact.**
 
-`ml.orders_training` (SQL, reviewable in a diff) chooses the rows, defines the label, and excludes leakage. The model artifact is a single sklearn `Pipeline` containing imputation, encoding, scaling *and* the classifier — so inference physically cannot apply different preprocessing from training, because there is one object and one code path. Splitting them is how training/serving skew happens, and it looks fine offline.
+`ml.orders_training` (SQL, reviewable in a diff) chooses the rows, defines the label, and excludes leakage. The model artifact is a single sklearn `Pipeline` containing text normalisation, imputation, encoding, scaling *and* the classifier — so inference physically cannot apply different preprocessing from training, because there is one object and one code path. Splitting them is how training/serving skew happens, and it looks fine offline.
+
+**A real instance of exactly that, found 2026-08-27 and fixed.** The ETL lowercases every string column, so the model learned from lowercase values — but nothing normalised the *inference* input, so a caller sending `EMEA` hit `handle_unknown="ignore"` and was encoded as all zeros. Not an error: a quietly worse prediction. The cleaning now runs as the first step *inside* the pipeline, so both paths share it by construction rather than by discipline, and the smoke test asserts a mixed-case request scores identically.
+
+**The contract lives in `ml/features.py`, which is not organisational tidiness.** SageMaker script mode runs the training entry point as `__main__`, so a transform function defined there is pickled as `__main__.normalise_text` — a name that does not resolve in the inference container, where `inference.py` is the entry point. The model would train successfully and fail to load. A shared module makes the reference resolvable from either direction, and `scripts/train_model.sh` must include it in the source archive.
 
 Leakage exclusions are documented in the view rather than inferred. `shipping_days` was among them and **is no longer** (TR-15): it is populated on `pending` orders, which have not shipped, and on `cancelled` ones, which never will, so it is an estimate available when the order is placed rather than an observed outcome. Excluding it was discarding a legitimate feature. Still excluded: `pending` orders are excluded because they have not resolved, and at scoring time every new order is pending; the hour of `order_ts` is excluded because a substantial share of source rows carry a date with no time, so hour would encode which timestamp format the row arrived in — a property of our ETL, not of the order.
 
@@ -480,6 +484,14 @@ directory applied manually is the usual answer).
 
 **Decided for Redshift DDL (2026-08-27):** ordered, re-runnable files in `sql/migrations/`, applied by `scripts/redshift_sql.sh` through the Data API. Terraform does not run them — it owns infrastructure, not schema. Placeholders are filled from terraform outputs, and a file naming one with no value fails rather than substituting an empty string.
 
+**One scoped exception, added 2026-08-27:** Terraform uploads the committed
+sample CSV into the raw zone, so a fresh environment runs end to end with no
+manual landing step. This crosses the line D-38 draws, and is acceptable only
+because the file is a repository fixture rather than a feed. Managing real data
+this way would make the raw zone — the single copy everything else is
+regenerable from — a function of a plan: deleted on destroy, restored on drift.
+It is behind `seed_sample_data`, which must be false for any real source.
+
 **Migrations are additive and re-runnable; destructive one-offs are not migrations.** Every statement in `sql/migrations/` is `CREATE ... IF NOT EXISTS` or `CREATE OR REPLACE`, so the directory can be applied repeatedly. A rebuild cannot live there: placed at the end it runs *after* the views that depend on the schema it is meant to repair, and placed anywhere it would drop data on every routine run. Those live in `sql/` and are invoked deliberately — `sql/rebuild_landing_orders.sql`, `sql/load_orders.sql`, `sql/unload_training_set.sql`. `tests/test_sql.py` enforces the split.
 
 **D-39 — Cost guardrails.** An AWS Budget with an alarm at a threshold set from
@@ -585,3 +597,5 @@ need a second load to observe at all: that a repeated load does not double rows
 | 2026-08-27 | Endpoint reached InService. API Gateway stage needed an account-level CloudWatch Logs role — added, with the account-wide blast radius recorded (T-5.15). |
 | 2026-08-27 | **Pipeline runs end to end**: raw CSV → Glue → Parquet → Redshift → training → registry → endpoint → public API. Smoke test green. Fixed an information leak found by it: SageMaker's `ModelError` wrapper carries the account id and a console URL, and the proxy was passing it to callers. |
 | 2026-08-27 | Transform substantially revised: `order_ts` stored as a UTC epoch, all text lowercased, money moved to `double` so a missing price can be NaN, missing integers to NULL, exact duplicate rows rejected, closed sets and format patterns on every identifier, and eight derived columns added. `shipping_days` reclassified from leakage to feature. Warehouse schema rebuilt to match. |
+| 2026-08-27 | Sample data seeded into the raw zone by Terraform behind `seed_sample_data` — a scoped exception to D-38 so a fresh environment needs no manual landing. README gained a section on AWS conditions Terraform cannot satisfy: quotas, Cost Explorer, billing access, AZ count, global bucket-name uniqueness. |
+| 2026-08-27 | Fixed real training/serving skew: inference did not apply the ETL's text lowercasing, so mixed-case input was silently encoded as unseen. Normalisation moved inside the pipeline, and the feature contract extracted to `ml/features.py` so the pickled reference resolves in both the training and inference containers. |

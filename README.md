@@ -33,7 +33,8 @@ S3 (raw) ──Glue──► S3 (processed) ──Spectrum──► Redshift ─
 ## Quick start
 
 Assuming the [toolchain](#1-install-the-toolchain) is installed and the
-[state bucket](#4-create-the-terraform-state-bucket) exists:
+[state bucket](#4-create-the-terraform-state-bucket) exists. This is the whole
+path on a clean AWS account, in order:
 
 ```bash
 git clone <repo-url> && cd sandbox
@@ -41,7 +42,7 @@ make install                        # venv, dependencies, pre-commit hooks
 aws sso login --profile <profile>   # or export credentials
 make preflight                      # confirm the toolchain and credentials
 
-make deploy                         # terraform init + apply (prompts)
+make deploy                         # terraform init + apply — also seeds the sample data
 make data                           # land → transform → migrate → load
 make model                          # train → approve
 #   paste the printed ARN into envs/dev/terraform.tfvars
@@ -192,7 +193,46 @@ If it already exists, confirm versioning is on. To use local state instead, see
 > `envs/dev/backend.tf`, and the bucket must be in the same region as `region`
 > there.
 
-### 5. Check everything before you deploy
+### 5. Things Terraform cannot do for you
+
+Terraform creates everything in this project, but a few AWS-side conditions sit
+outside any configuration. Most accounts already satisfy them; these are the
+ones to check when something fails in a way the error message does not explain.
+
+| What | Why Terraform cannot | When it bites |
+|---|---|---|
+| **The state backend bucket** | It would have to hold the state describing itself | Always — step 4 above |
+| **Valid credentials** | Interactive login | Always |
+| **Service quotas** | Quotas are account limits, not resources. A new account can have a quota of zero for an instance family | `make train` fails with `ResourceLimitExceeded`, or the Redshift workgroup will not reach `AVAILABLE` |
+| **Cost Explorer** | Must be enabled once in the billing console, and takes up to 24 hours to populate | Needed before an AWS Budget (T-6.3) reports anything |
+| **Billing access for non-root principals** | Enabled by the root user in Account Settings | You cannot see costs, or a budget cannot be created |
+| **Three usable availability zones** | Redshift Serverless requires them; a region or account may offer fewer | The workgroup fails to create |
+| **A globally unique bucket name** | S3 names are global, and `bucket_suffix` is the owner tag, not the account id | `BucketAlreadyExists` on the very first apply |
+
+**Quotas are the most likely of these to surprise you.** Check the ones this
+project uses before a first deploy in an unfamiliar account:
+
+```bash
+# SageMaker training instances — commonly 0 in a new account
+aws service-quotas list-service-quotas --service-code sagemaker \
+  --query "Quotas[?contains(QuotaName, 'ml.m5.large for training')].{Name:QuotaName,Value:Value}"
+
+# Redshift Serverless capacity
+aws service-quotas list-service-quotas --service-code redshift-serverless \
+  --query "Quotas[].{Name:QuotaName,Value:Value}" --output table
+```
+
+Raise one in the Service Quotas console, or with
+`aws service-quotas request-service-quota-increase`. An increase is a support
+request and is not instant.
+
+**One thing Terraform does that reaches beyond this project:** it sets
+`aws_api_gateway_account`, the account-wide CloudWatch Logs role for API
+Gateway. Destroying this stack disables API Gateway logging for the whole
+account, and another stack setting it would conflict. Fine in a dedicated
+account — see T-5.15 before using a shared one.
+
+### 6. Check everything before you deploy
 
 ```bash
 make preflight
@@ -220,7 +260,7 @@ make plan
 This creates everything except the inference stack: buckets, KMS keys, the Glue
 job, the VPC, Redshift Serverless, the SageMaker role and the model registry.
 The endpoint, Lambda and API Gateway stay absent until a model is approved (see
-[Deploy the model](#6-deploy-the-model-two-manual-steps-deliberately)).
+[Deploy the model](#6-deploy-the-model)).
 
 ---
 
@@ -232,15 +272,33 @@ Each stage has its own target, so you can run one or all of them.
 make data     # = land + etl + migrate + load
 ```
 
+**On a fresh environment, `make data` is the one you want.** `make rebuild` does
+the same work plus clearing a stale catalog table and dropping `landing.orders`
+first — both no-ops on a clean account, and only needed after a *transform
+change* has left artefacts written by an older version of the job. Use it when a
+load fails on a column that should exist.
+
 ### 1. Land the data
 
+**`terraform apply` already did this.** The committed sample file is uploaded
+into the raw zone as part of the apply, so a fresh environment can run the rest
+of the pipeline with no landing step.
+
+To land it again, or to land something else:
+
 ```bash
-make land
+make land                                    # re-upload the sample file
+aws s3 cp ./other.csv "s3://$(terraform -chdir=envs/dev output -raw raw_bucket_name)/takehome/orders/"
 ```
 
-Uploads `data/dpe_interview_takehome_data.csv` to
-`s3://<raw>/takehome/orders/`. Raw is flat — no date in the path; the date
-belongs to the *run*. See [docs/data-layout.md](./docs/data-layout.md).
+Raw is flat — no date in the path; the date belongs to the *run*. See
+[docs/data-layout.md](./docs/data-layout.md).
+
+> **The seeded file is a fixture, not an ingestion mechanism.** Terraform owns
+> that one object, so it restores it on apply and removes it on destroy. A real
+> feed must not be managed this way — set `seed_sample_data = false`, and note
+> that until you do, replacing that exact key by hand will be reverted on the
+> next apply.
 
 ### 2. Transform
 
@@ -266,7 +324,7 @@ Rows that fail validation are **quarantined, not dropped**, under
 that row failed. The run fails if more than `etl_max_reject_pct` of rows are
 rejected — a threshold worth re-deriving once you have seen a real run.
 
-### 3. Apply the schema migrations — **manual, and not part of `terraform apply`**
+### 3. Apply the schema migrations
 
 ```bash
 make migrate
@@ -310,13 +368,20 @@ when the order is placed. What it learns from — and what it must not see — i
 defined in
 [`sql/migrations/005_ml_training_view.sql`](./sql/migrations/005_ml_training_view.sql).
 
+The artifact is a single sklearn `Pipeline` with preprocessing inside it,
+including the same text cleaning the ETL applies. Training and inference
+therefore share one code path (D-27): a request in mixed case scores identically
+to one in lowercase, and `make smoke` checks that. The feature list and that
+cleaning live in `ml/features.py`, imported by both entry points — which is also
+what makes the fitted pipeline loadable in the inference container.
+
 > The training script reports cross-validated metrics and warns when the dataset
 > is too small for them to mean anything. Treat the pipeline as the deliverable
 > and the score as a by-product until the open questions in
 > [proposed-transformations.md](./docs/proposed-transformations.md) are settled —
 > TR-16 in particular, since an unconfirmed date convention feeds `order_dow`.
 
-### 6. Deploy the model — **approve, then apply**
+### 6. Deploy the model
 
 ```bash
 make promote        # approve, and record the ARN in terraform.tfvars
@@ -345,9 +410,15 @@ place. Clearing the ARN removes the whole inference stack.
 make smoke
 ```
 
-Exercises the public path exactly as an external consumer would: valid single
-and batch requests, unseen categorical values, three malformed payloads, and a
-request with no API key.
+Exercises the public path exactly as an external consumer would. Each line
+states what the endpoint is expected to *do*, so `ok` reads as "it did that",
+and every check prints the response body — a status code on its own once hid a
+400 whose body leaked the AWS account id.
+
+It covers scoring one order and a batch, scoring values the model has never
+seen, rejecting an order missing one field and one missing most, rejecting an
+empty list and malformed JSON, scoring mixed case identically to lowercase, and
+refusing a request with no API key.
 
 By hand:
 
@@ -394,6 +465,8 @@ These are the things no target can do for you, and why.
 | `aws sso login` | Interactive |
 | `terraform apply` | A developer reviews the plan (D-07). Never auto-approved |
 | `make migrate` | Terraform does not own schema (D-38). Automated by `make data`, but never by an apply |
+| Raising a service quota | An account limit, not a resource — and an increase is a support request |
+| Enabling Cost Explorer | A billing-console action, and it takes up to 24 hours to populate |
 | Approving a model | A human decides a version is fit to serve (D-31). `make promote` records the ARN afterwards, but the decision is the prompt |
 | Reviewing and applying that change | Nothing reaches the endpoint until the diff is read and applied (D-07, D-31) |
 | Committing and pushing | Never done unprompted (D-08) |
@@ -514,6 +587,37 @@ make destroy
 Buckets must be emptied first unless `force_destroy_buckets = true`.
 
 ---
+
+## Why a first apply often fails
+
+Most of what this project configures cannot be validated without calling AWS.
+`terraform validate` checks syntax and provider schemas; it does not know that
+network isolation is rejected on a serverless endpoint, that API Gateway needs
+an account-level logging role before a stage can log, or that a workgroup in
+`MODIFYING` refuses statements. Those surface on the first apply, and always
+will.
+
+What the project does about it:
+
+| Guard | Catches |
+|---|---|
+| `make check` | Formatting, provider-schema errors, lint, policy findings, and the fast tests |
+| `make test` | The transform, the model, the API proxy and the SQL contract, run locally against the real sample file |
+| Drift tests | The feature list disagreeing across the training view, `train.py`, the API contract, the README and the smoke test |
+| `make preflight` | Toolchain, credentials, and the state bucket |
+| `make verify` | What is actually deployed, including whether the deployed job script matches your working tree |
+| `make rebuild` | A schema change reaching catalog, Parquet, table and views in the right order |
+
+**The ordering trap is the one worth internalising.** A change to the transform
+has to propagate through the job script, the processed Parquet, the Glue
+catalog, the external table, the landing table, the views, the model and the API
+contract — in that order. Fixing one link at a time produces a sequence of
+unrelated-looking errors. `make rebuild` does the whole chain; `make etl` refuses
+to run a job script older than the one in your working tree.
+
+**When something does fail on a first apply, the useful question is whether it
+was knowable locally.** If it was, the fix belongs in a test rather than in a
+retry.
 
 ## Troubleshooting
 
@@ -679,7 +783,7 @@ envs/dev/                   the root module — one directory per environment
   network.tf redshift.tf sagemaker.tf inference.tf api.tf
 modules/s3_bucket/          private, encrypted bucket used for all three zones
 glue/jobs/                  the PySpark ETL job
-ml/                         train.py and inference.py — run locally and in SageMaker
+ml/                         features.py (the contract), train.py, inference.py
 lambda/predict/             API Gateway → SageMaker proxy
 sql/                        migrations, the partition load, the training UNLOAD
 scripts/                    the manual steps, scripted (see the table above)

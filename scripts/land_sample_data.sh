@@ -36,8 +36,20 @@ DATASET=$(tf_output etl_dataset)
 
 KEY="$SOURCE_NAME/$DATASET/$(basename "$FILE")"
 
-echo "landing s3://$RAW_BUCKET/$KEY"
-aws s3 cp "$FILE" "s3://$RAW_BUCKET/$KEY"
+# `terraform apply` seeds this same object when seed_sample_data is on, and it
+# is Terraform-managed. Overwriting it with `aws s3 cp` would drop the tags
+# Terraform set and show as drift on the next plan — so if the content already
+# matches, leave it alone.
+LOCAL_HASH=$(python3 -c 'import hashlib,sys; print(hashlib.md5(open(sys.argv[1],"rb").read()).hexdigest())' "$FILE")
+REMOTE_HASH=$(aws s3 cp "s3://$RAW_BUCKET/$KEY" - 2>/dev/null \
+  | python3 -c 'import hashlib,sys; print(hashlib.md5(sys.stdin.buffer.read()).hexdigest())') || REMOTE_HASH=""
+
+if [[ "$LOCAL_HASH" == "$REMOTE_HASH" ]]; then
+  echo "s3://$RAW_BUCKET/$KEY is already identical — nothing to upload"
+else
+  echo "landing s3://$RAW_BUCKET/$KEY"
+  aws s3 cp "$FILE" "s3://$RAW_BUCKET/$KEY"
+fi
 
 cat <<'MSG'
 

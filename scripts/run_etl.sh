@@ -19,6 +19,37 @@ tf_output() { terraform -chdir=envs/dev output -raw "$1" 2>/dev/null; }
 JOB=$(tf_output glue_job_name) || {
   echo "error: could not read terraform outputs. Is the stack applied?" >&2; exit 1; }
 
+# Is the deployed script the one in the working tree?
+#
+# Terraform uploads the job script on apply. Editing it and running the job
+# without applying runs the *previous* version, and the symptom appears much
+# later and somewhere else — a downstream schema that does not match, or a fix
+# that appears not to have worked. Cheap to check, so check.
+ARTIFACTS=$(tf_output artifacts_bucket_name)
+SCRIPT_KEY="glue/scripts/raw_to_processed.py"
+
+DEPLOYED_HASH=$(aws s3 cp "s3://$ARTIFACTS/$SCRIPT_KEY" - 2>/dev/null \
+  | python3 -c 'import hashlib,sys; print(hashlib.md5(sys.stdin.buffer.read()).hexdigest())') \
+  || DEPLOYED_HASH=""
+LOCAL_HASH=$(python3 -c 'import hashlib; print(hashlib.md5(open("glue/jobs/raw_to_processed.py","rb").read()).hexdigest())')
+
+if [[ -z "$DEPLOYED_HASH" ]]; then
+  echo "warning: could not read the deployed job script; running anyway" >&2
+elif [[ "$DEPLOYED_HASH" != "$LOCAL_HASH" ]]; then
+  cat >&2 <<MSG
+error: the deployed job script differs from glue/jobs/raw_to_processed.py.
+
+  deployed: $DEPLOYED_HASH
+  local:    $LOCAL_HASH
+
+Running now would execute the previous version, and the symptom would surface
+later and somewhere else. Deploy the current one first:
+
+  make apply
+MSG
+  exit 1
+fi
+
 INGEST_DATE="${1:-}"
 ARGS=()
 if [[ -n "$INGEST_DATE" ]]; then

@@ -61,6 +61,18 @@ variable "force_destroy_buckets" {
   default     = false
 }
 
+variable "seed_sample_data" {
+  description = "Upload the committed sample CSV into the raw zone so a fresh environment runs end to end with no manual step. A scoped exception to D-38 — set false for any real feed, where Terraform must not own the data."
+  type        = bool
+  default     = true
+}
+
+variable "sample_data_path" {
+  description = "Repo-relative path to the sample file seeded into the raw zone."
+  type        = string
+  default     = "data/dpe_interview_takehome_data.csv"
+}
+
 # ------------------------------- storage: zones -------------------------------
 
 variable "artifacts_noncurrent_version_expiration_days" {

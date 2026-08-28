@@ -83,3 +83,37 @@ resource "aws_s3_object" "raw_dataset_prefix" {
     module.raw
   ]
 }
+
+# -----------------------------------------------------------------------------
+# Sample data (dev convenience)
+#
+# This is a deliberate, scoped exception to D-38, which says Terraform owns
+# infrastructure and not data in S3. It exists so a fresh environment runs the
+# pipeline end to end without a manual landing step.
+#
+# It is safe only because this file is a fixture committed to the repository,
+# not a feed. Real data must never be managed this way: Terraform would delete
+# it on destroy, rewrite it on drift, and make the raw zone — the one copy
+# everything else is regenerable from — a function of a plan.
+#
+# `seed_sample_data = false` turns it off, which is what a real source requires.
+# source_hash rather than etag: KMS-encrypted objects expose no MD5 etag, so
+# etag-based drift detection would fire on every plan.
+# -----------------------------------------------------------------------------
+
+resource "aws_s3_object" "sample_data" {
+  count = var.seed_sample_data ? 1 : 0
+
+  bucket = module.raw.id
+  key    = "${var.etl_source_name}/${var.etl_dataset}/${basename(var.sample_data_path)}"
+
+  source      = "${path.module}/../../${var.sample_data_path}"
+  source_hash = filemd5("${path.module}/../../${var.sample_data_path}")
+
+  tags = {
+    Name      = basename(var.sample_data_path)
+    Component = "storage"
+    DataZone  = "raw"
+    Managed   = "sample-fixture"
+  }
+}

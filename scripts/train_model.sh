@@ -44,10 +44,11 @@ scripts/redshift_sql.sh sql/unload_training_set.sql "training_prefix=${TRAINING_
 echo "==> 2/4 packaging training source to $SOURCE_URI"
 STAGING=$(mktemp -d)
 trap 'rm -rf "$STAGING"' EXIT
-# Both files: train.py runs in the training container, inference.py in the
-# endpoint, and inference.py imports the feature list from train.py so the two
-# cannot drift (D-27).
-tar -czf "$STAGING/sourcedir.tar.gz" -C ml train.py inference.py
+# All three: train.py runs in the training container, inference.py in the
+# endpoint, and both import the feature list and text cleaning from features.py
+# so they cannot drift (D-27). features.py must be present in the archive or the
+# fitted pipeline will not unpickle at inference time.
+tar -czf "$STAGING/sourcedir.tar.gz" -C ml features.py train.py inference.py
 aws s3 cp "$STAGING/sourcedir.tar.gz" "$SOURCE_URI"
 
 echo "==> 3/4 training job $JOB_NAME"
