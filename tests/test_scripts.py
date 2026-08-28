@@ -91,6 +91,26 @@ class TestVerdicts:
         assert "exit 1" in source
 
 
+class TestSmokeTestAssertions:
+    @pytest.fixture
+    def source(self):
+        return (ROOT / "scripts" / "smoke_test_endpoint.sh").read_text()
+
+    def test_the_api_key_is_checked_before_any_request(self, source):
+        """An unreadable key was sent as an empty header, and every check
+        returned 403 — nine failures describing one problem, none naming it."""
+        assert 'API_KEY" == "None"' in source or '"$API_KEY" == "None"' in source
+        assert source.index("could not read the value of API key") < source.index("check \"scores one order\"")
+
+    def test_comparison_checks_require_a_successful_response(self, source):
+        """The mixed-case check asserted only that two responses were equal.
+        Two identical 403s are equal, so it reported ok while every request was
+        being refused."""
+        assert "refund_probability*" in source, (
+            "the mixed-case check must require a prediction, not just agreement"
+        )
+
+
 class TestMakefile:
     @pytest.fixture(scope="class")
     def makefile(self):

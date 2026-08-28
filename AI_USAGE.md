@@ -2522,3 +2522,60 @@ one matters most — a script that prints "FAILED" and exits 0 would pass in
 **Notes**
 
 Accepted as-is.
+
+---
+
+### 041 — Every request 403, and a check that passed anyway
+
+- **Date:** 2026-08-27
+- **Model:** Claude Opus 5 (`claude-opus-5[1m]`)
+- **Tool:** Claude Code CLI
+- **Files touched:** `scripts/smoke_test_endpoint.sh`, `envs/dev/outputs.tf`, `tests/test_scripts.py`, `README.md`
+
+**Prompt**
+
+```text
+this was from a fresh deploy [make smoke — 7 of 9 checks FAIL with
+403 {"message":"Forbidden"}]
+```
+
+**Output**
+
+Two problems, one of them mine and worse than the symptom.
+
+**The mixed-case check reported `ok` while every request was being refused.** It
+asserted that two responses were *equal*, and two identical `403 Forbidden`
+bodies are equal. A check meant to prove the model normalises its input passed
+without a prediction existing. It now requires a prediction before comparing —
+otherwise it fails and says nothing was compared.
+
+That is the more serious finding: the run was reported as 7 of 9 failures when
+it was really 8 of 9, and the passing one was passing for no reason.
+
+**The script never checked that it had a key.** `API_KEY=$(aws apigateway
+get-api-key ...)` was used unguarded, so an unreadable key is sent as an empty
+header and every check returns 403 — nine failures describing one problem, none
+of them naming it. It now fails immediately if the key cannot be read, is
+disabled, or is attached to no usage plan covering the stage. That last case is
+worth naming because API Gateway refuses such a key exactly as it refuses no key
+at all.
+
+**Added a warm-up retry on 403.** A usage-plan key association is not instant on
+a fresh deploy and reads as `Forbidden` until it propagates, which is
+indistinguishable from a misconfiguration in a single attempt. The warm-up now
+retries, and says so explicitly if 403 persists, since at that point it is not
+propagation.
+
+Added regression tests for both: the key must be validated before the first
+request, and comparison checks must require a successful response rather than
+agreement alone.
+
+**Verification run:** 253 tests pass; all five pre-commit hooks pass. Nothing was
+run against AWS, so whether this particular 403 was propagation or configuration
+is untested — the script now distinguishes them.
+
+**Notes**
+
+Accepted as-is. Re-run `make smoke`: if it was propagation the retry absorbs it,
+and if it was not, the preflight names which of the three causes it is instead
+of reporting seven identical failures.

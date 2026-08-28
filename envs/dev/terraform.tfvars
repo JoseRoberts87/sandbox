@@ -63,7 +63,7 @@ redshift_enhanced_vpc_routing = false
 # step (D-31) and creates the endpoint, the Lambda proxy and the public API;
 # clearing it removes them. `make promote` writes this line for you on approval;
 # it still takes a reviewed diff and a manual apply to reach the endpoint.
-approved_model_package_arn = "arn:aws:sagemaker:us-east-1:823878989845:model-package/sandbox-dev-orders-refund-risk/4"
+approved_model_package_arn = ""
 endpoint_memory_mb         = 2048
 endpoint_max_concurrency   = 5
 

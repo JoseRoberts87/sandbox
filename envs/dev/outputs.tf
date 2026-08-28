@@ -167,3 +167,8 @@ output "predict_required_fields" {
   description = "Fields the API requires on every instance. Read by the smoke test so it cannot fall behind the deployed contract."
   value       = var.predict_required_fields
 }
+
+output "environment" {
+  description = "Environment name. Also the API Gateway stage name."
+  value       = var.environment
+}
